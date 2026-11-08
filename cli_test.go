@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -225,5 +226,58 @@ func TestWithLoginHint(t *testing.T) {
 		if got := withLoginHint(tc.link, tc.email); got != tc.link {
 			t.Errorf("withLoginHint(%q, %q) = %q, want unchanged", tc.link, tc.email, got)
 		}
+	}
+}
+
+func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
+	src := newAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
+	dst := newAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
+	now := time.Now()
+	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
+	src.writeLongToken(accountNamed(t, src, "spare"), newLongToken("sk-ant-oat01-spare", now))
+	expired := newLongToken("sk-ant-oat01-old", now.Add(-400*24*time.Hour))
+	src.writeLongToken(accountNamed(t, src, "work"), expired)
+
+	ok := func(string) (int, error) { return 200, nil }
+	send := func(host, id string, record []byte) (string, error) {
+		var out bytes.Buffer
+		err := importToken(dst, []string{id}, ok, bytes.NewReader(record), &out)
+		if err != nil {
+			return err.Error(), err
+		}
+		return strings.TrimSpace(out.String()), nil
+	}
+	var out bytes.Buffer
+	err := shareTokens(src, []string{"mini"}, send, &out)
+	// spare does not exist on the destination, so it fails; work is skipped as expired.
+	if err == nil || !strings.Contains(err.Error(), "spare") || !strings.Contains(out.String(), "work has no 1-year token") {
+		t.Fatal(err, out.String())
+	}
+	if got := dst.readToken(accountNamed(t, dst, "default")); got != "sk-ant-oat01-def" {
+		t.Fatal(got)
+	}
+	if got := dst.readToken(accountNamed(t, dst, "work")); got != "y" {
+		t.Fatal(got)
+	}
+
+	rejected := func(string) (int, error) { return 401, nil }
+	record, _ := json.Marshal(newLongToken("sk-ant-oat01-bad", now))
+	if importToken(dst, []string{"work"}, rejected, bytes.NewReader(record), &bytes.Buffer{}) == nil {
+		t.Fatal("a rejected token was imported")
+	}
+	if importToken(dst, []string{"work"}, ok, strings.NewReader("{}"), &bytes.Buffer{}) == nil {
+		t.Fatal("an empty record was imported")
+	}
+}
+
+func TestKeychainModeAlsoReadsTheTokenFile(t *testing.T) {
+	home := makeHome(t, map[string]string{"work": "y"})
+	file := newAccounts(home, credentialsFile, "")
+	acc := accountNamed(t, file, "work")
+	acc.ID = "limitbreak-test-absent-" + strings.ReplaceAll(t.Name(), "/", "-") // never in the real Keychain
+	file.writeLongToken(acc, newLongToken("sk-ant-oat01-file", time.Now()))
+	kc := newAccounts(home, credentialsKeychain, "")
+	if got, ok := kc.readLongToken(acc); !ok || got.Token != "sk-ant-oat01-file" {
+		t.Fatal(got, ok)
 	}
 }

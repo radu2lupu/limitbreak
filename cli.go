@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ limitbreak add [name]           sign in a new account (opens the browser)
 limitbreak list                 show the accounts and when each one's login ends
 limitbreak renew [name...] [--all]
                                 give accounts a 1-year token (one browser authorization each)
+limitbreak share <ssh-host>     copy the 1-year tokens to the same-named accounts on another machine
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak video                watch a switch happen as an arcade battle (simulated, no real login touched)
 
@@ -51,6 +53,10 @@ func runCommand(command string, args []string) int {
 		listAccounts(a, os.Stdout)
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
+	case "share":
+		err = shareTokens(a, args, sshImport, os.Stdout)
+	case "import-token":
+		err = importToken(a, args, countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdin, os.Stdout)
 	case "remove":
 		err = removeAccount(a, args, os.Stdin, os.Stdout)
 	default:
@@ -520,4 +526,92 @@ func openBrowser(link string) int {
 		return 1
 	}
 	return 0
+}
+
+// MARK: Share
+
+// A 1-year token is a plain bearer token that never rotates, so unlike a sign-in it can be copied
+// to another machine without the two logging each other out.
+
+// remoteImport sends one account's token record to `limitbreak import-token` on an SSH host.
+type remoteImport func(host, id string, record []byte) (string, error)
+
+func sshImport(host, id string, record []byte) (string, error) {
+	cmd := exec.Command("ssh", host, `"$HOME/.local/bin/limitbreak" import-token `+shellQuote(id))
+	cmd.Stdin = bytes.NewReader(record)
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// shareTokens copies every account's unexpired 1-year token to the same-named account on host.
+func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) error {
+	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
+		return fmt.Errorf("usage: limitbreak share <ssh-host>")
+	}
+	host := args[0]
+	now := a.now()
+	var failed []string
+	shared := 0
+	for _, acc := range freshAccounts(a) {
+		t, ok := a.readLongToken(acc)
+		if !ok || !t.valid(now) {
+			fmt.Fprintf(out, "%s has no 1-year token; skipped (run limitbreak renew %s).\n", acc.ID, acc.ID)
+			continue
+		}
+		record, err := json.Marshal(t)
+		if err != nil {
+			return err
+		}
+		reply, err := send(host, acc.ID, record)
+		if reply != "" {
+			fmt.Fprintf(out, "%s: %s\n", host, reply)
+		}
+		if err != nil {
+			failed = append(failed, acc.ID)
+			continue
+		}
+		shared++
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("not shared to %s: %s", host, strings.Join(failed, ", "))
+	}
+	fmt.Fprintf(out, "Shared %d token(s) to %s.\n", shared, host)
+	return nil
+}
+
+// importToken stores a token record read from in for the named local account, after Anthropic
+// accepts it. The account must already exist here, so the proxy knows it.
+func importToken(a *accounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: limitbreak import-token <name> < record.json")
+	}
+	raw, err := io.ReadAll(io.LimitReader(in, 64*1024))
+	if err != nil {
+		return err
+	}
+	var t longToken
+	if json.Unmarshal(raw, &t) != nil || !longTokenPattern.MatchString(t.Token) {
+		return fmt.Errorf("no token record on stdin")
+	}
+	if !t.valid(a.now()) {
+		return fmt.Errorf("the token has expired")
+	}
+	var target *account
+	for _, acc := range freshAccounts(a) {
+		if acc.ID == args[0] {
+			acc := acc
+			target = &acc
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("no account named %q here; sign it in first (limitbreak add %s)", args[0], args[0])
+	}
+	if status, err := validate(t.Token); err == nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
+		return fmt.Errorf("Anthropic rejected the token (HTTP %d); not stored", status)
+	}
+	if err := a.writeLongToken(*target, t); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s now has a 1-year token until %s.\n", target.ID, day(time.UnixMilli(t.ExpiresAt)))
+	return nil
 }

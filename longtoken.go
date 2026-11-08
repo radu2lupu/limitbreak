@@ -124,25 +124,25 @@ func longTokenPath(acc account) string { return filepath.Join(acc.Path, longToke
 
 // readLongToken is the account's stored long-lived token, expired or not; false when none.
 func (a *accounts) readLongToken(acc account) (longToken, bool) {
-	var raw []byte
+	var sources [][]byte
 	if a.credentials == credentialsKeychain {
-		out, err := exec.Command("security", "find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w").Output()
-		if err != nil {
-			return longToken{}, false
+		if out, err := exec.Command("security", "find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w").Output(); err == nil {
+			sources = append(sources, out)
 		}
-		raw = out
-	} else {
-		out, err := os.ReadFile(longTokenPath(acc))
-		if err != nil {
-			return longToken{}, false
+	}
+	// The file is read in Keychain mode too: a Mac reached over SSH has a locked Keychain, so a
+	// token stored from there (`limitbreak share`, or renew over SSH) lands in the file.
+	if out, err := os.ReadFile(longTokenPath(acc)); err == nil {
+		sources = append(sources, out)
+	}
+	var best longToken
+	for _, raw := range sources {
+		var t longToken
+		if json.Unmarshal(bytes.TrimSpace(raw), &t) == nil && t.Token != "" && t.ExpiresAt > best.ExpiresAt {
+			best = t
 		}
-		raw = out
 	}
-	var t longToken
-	if json.Unmarshal(bytes.TrimSpace(raw), &t) != nil || t.Token == "" {
-		return longToken{}, false
-	}
-	return t, true
+	return best, best.Token != ""
 }
 
 func (a *accounts) writeLongToken(acc account, t longToken) error {
@@ -154,10 +154,11 @@ func (a *accounts) writeLongToken(acc account, t longToken) error {
 		// `security` takes the secret as an argument, so it is visible in the process list for the
 		// moment the command runs. Acceptable on a single-user Mac; it is never written to a log.
 		out, err := exec.Command("security", "add-generic-password", "-U", "-a", acc.ID, "-s", longTokenService, "-w", string(raw)).CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("keychain: %v: %s", err, bytes.TrimSpace(out))
+		if err == nil {
+			return nil
 		}
-		return nil
+		// A locked Keychain (a session over SSH) cannot take it; the file can, and is read too.
+		log.Printf("keychain unavailable for %s (%s); storing the token in %s", acc.ID, bytes.TrimSpace(out), longTokenPath(acc))
 	}
 	// A temp file is created 0600 and renamed over, so the token is never readable by others, not
 	// even for a moment, and a crash leaves the old record whole.
@@ -181,7 +182,6 @@ func (a *accounts) deleteLongToken(acc account) error {
 	if a.credentials == credentialsKeychain {
 		// Exit status 44 is "not found"; any other failure leaves nothing we can do from here.
 		_ = exec.Command("security", "delete-generic-password", "-a", acc.ID, "-s", longTokenService).Run()
-		return nil
 	}
 	if err := os.Remove(longTokenPath(acc)); err != nil && !os.IsNotExist(err) {
 		return err

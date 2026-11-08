@@ -83,7 +83,9 @@ limitbreak renew work     # just this one
 limitbreak renew --all    # every account, even those with a fresh token
 ```
 
-For each account it runs Claude Code's `claude setup-token` and you authorize once in the browser. The sign-in page opens with the account's email already filled in (as `claude auth login --email` does). If the browser is already signed in to claude.ai as someone else, that session may win, so check it matches the email `renew` prints. Each account then gets a 1-year token, kept in the Keychain (item `limitbreak-token`) on macOS or in `<dir>/.limitbreak-token.json` (mode 600) elsewhere. The proxy uses it in place of the sign-in.
+For each account it runs Claude Code's `claude setup-token` and you authorize once in the browser. The sign-in page opens with the account's email already filled in (as `claude auth login --email` does). If the browser is already signed in to claude.ai as someone else, that session may win, so check it matches the email `renew` prints. Each account then gets a 1-year token, kept in the Keychain (item `limitbreak-token`) on macOS, or in `<dir>/.limitbreak-token.json` (mode 600) elsewhere and when the Keychain is locked (a Mac reached over SSH). The proxy uses it in place of the sign-in.
+
+To use the same tokens on another machine of yours, sign the same-named accounts in there once, install limitbreak, then from this one run `limitbreak share <ssh-host>`. Unlike a sign-in, a 1-year token never rotates, so two machines holding it do not log each other out. The other machine checks each token with Anthropic before storing it.
 
 `limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
 
