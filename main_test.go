@@ -48,6 +48,8 @@ type upstream struct {
 	mu    sync.Mutex
 	seen  []string
 	paths []string
+	// unauthorized tokens are answered 401, like a revoked or expired login.
+	unauthorized []string
 }
 
 func newUpstream(t *testing.T, spent ...string) *upstream {
@@ -59,6 +61,13 @@ func newUpstream(t *testing.T, spent ...string) *upstream {
 		u.seen = append(u.seen, token)
 		u.paths = append(u.paths, r.URL.RequestURI())
 		u.mu.Unlock()
+		for _, s := range u.unauthorized {
+			if token == "Bearer "+s {
+				w.WriteHeader(401)
+				w.Write([]byte("unauthorized"))
+				return
+			}
+		}
 		for _, s := range spent {
 			if token == "Bearer "+s {
 				w.Header().Set("anthropic-ratelimit-unified-status", "rejected")
@@ -248,6 +257,31 @@ func TestWithoutAnyUsableAccountTheRequestGoesOnWithClaudesOwnLogin(t *testing.T
 		t.Fatal(status)
 	}
 	if strings.Join(up.seen, ",") != "Bearer claude-own-login" {
+		t.Fatal(up.seen)
+	}
+}
+
+func TestAnAccountWhoseTokenIsRejectedIsSkippedWithoutClaudeSeeingThe401(t *testing.T) {
+	up := newUpstream(t)
+	up.unauthorized = []string{"t-default"}
+	server, _ := start(t, makeHome(t, map[string]string{"default": "t-default", "work": "t-work"}), up)
+	if status, body := post(t, server.URL, "/v1/messages"); status != 200 || body != "event: a\n\ndata: b\n\n" {
+		t.Fatal(status, body)
+	}
+	post(t, server.URL, "/v1/messages")
+	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-work,Bearer t-work" {
+		t.Fatal(up.seen)
+	}
+}
+
+func TestEveryTokenRejectedFallsBackToClaudesOwnLogin(t *testing.T) {
+	up := newUpstream(t)
+	up.unauthorized = []string{"t-default", "t-work"}
+	server, _ := start(t, makeHome(t, map[string]string{"default": "t-default", "work": "t-work"}), up)
+	if status, _ := post(t, server.URL, "/v1/messages"); status != 200 {
+		t.Fatal(status)
+	}
+	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-work,Bearer claude-own-login" {
 		t.Fatal(up.seen)
 	}
 }

@@ -15,7 +15,8 @@
 // `~/.claude-<name>` config dir with a login. Tokens are read, never copied or logged: from the
 // macOS Keychain item Claude Code keeps per config dir, or from `<dir>/.credentials.json`. An
 // expired token is refreshed by running one tiny `claude -p` under that dir, so Claude Code stays
-// the only thing that refreshes a login.
+// the only thing that refreshes a login. An account with a 1-year token from `limitbreak renew`
+// (`claude setup-token`) is sent on that token instead, so its monthly sign-in end stops mattering.
 //
 // A path may start with a client name (`/_c/<client>/v1/messages`); each client has its own active
 // account. Any other path is the shared client's. Requests that are not the messages API are
@@ -50,6 +51,7 @@ const (
 	// neverExpires stands for a login that states no expiry (epoch milliseconds).
 	neverExpires        = 4_000_000_000_000
 	defaultPort         = 48617
+	defaultUpstream     = "https://api.anthropic.com"
 	sharedClient        = "shared"
 	fallbackExhaustion  = time.Hour
 	unavailableBackoff  = 5 * time.Minute
@@ -259,21 +261,18 @@ func (a *accounts) token(acc account) string {
 	return a.readToken(acc)
 }
 
-// readToken is the access token that has not expired and lasts longest, across the login's sources.
+// readToken is the account's unexpired long-lived token when it has one (see longtoken.go), else
+// the access token that has not expired and lasts longest, across the login's sources.
 func (a *accounts) readToken(acc account) string {
+	if long, ok := a.readLongToken(acc); ok && long.valid(a.now()) {
+		return long.Token
+	}
 	var best string
 	bestExpiry := -1.0
 	for _, raw := range a.credentialSources(acc.Dir, acc.Path) {
-		var doc struct {
-			ClaudeAiOauth *login `json:"claudeAiOauth"`
-			login
-		}
-		if json.Unmarshal(raw, &doc) != nil {
+		l, ok := parseLogin(raw)
+		if !ok {
 			continue
-		}
-		l := doc.login
-		if doc.ClaudeAiOauth != nil {
-			l = *doc.ClaudeAiOauth
 		}
 		expiry := float64(neverExpires)
 		if l.ExpiresAt != nil {
@@ -292,6 +291,23 @@ func (a *accounts) readToken(acc account) string {
 type login struct {
 	AccessToken string   `json:"accessToken"`
 	ExpiresAt   *float64 `json:"expiresAt"`
+	// RefreshTokenExpiresAt is the sign-in's hard end (epoch ms); refreshing does not move it.
+	RefreshTokenExpiresAt *float64 `json:"refreshTokenExpiresAt"`
+}
+
+// parseLogin reads a credential document: Claude Code's `{"claudeAiOauth": {...}}` or a bare login.
+func parseLogin(raw []byte) (login, bool) {
+	var doc struct {
+		ClaudeAiOauth *login `json:"claudeAiOauth"`
+		login
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return login{}, false
+	}
+	if doc.ClaudeAiOauth != nil {
+		return *doc.ClaudeAiOauth, true
+	}
+	return doc.login, true
 }
 
 // claudeEnv is the environment for running `claude` as the login in configDir (empty: the default
@@ -467,6 +483,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			apiError(w, http.StatusBadGateway, "upstream unreachable")
 			return
 		}
+		p.accounts.recordUsage(*acc, resp.Header)
+		if resp.StatusCode == http.StatusUnauthorized {
+			// The account's token is dead (revoked, or its auth ended). Claude must not see that
+			// as its own login failing, so the account is skipped for a while, like a spent one.
+			log.Printf("account %s auth rejected (401); run \"limitbreak renew %s\"", acc.ID, acc.ID)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if p.accounts.spend(clientName, acc.ID, p.accounts.now().Add(unavailableBackoff)) != nil {
+				continue
+			}
+			p.passThrough(w, r, path, body)
+			return
+		}
 		if spent, reset := spentReset(resp.StatusCode, resp.Header); spent {
 			if p.accounts.spend(clientName, acc.ID, reset) != nil {
 				_, _ = io.Copy(io.Discard, resp.Body)
@@ -543,6 +572,9 @@ func relay(w http.ResponseWriter, resp *http.Response) {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) == 1 && os.Getenv(loginHintEnv) != "" && strings.HasPrefix(args[0], "http") {
+		os.Exit(openBrowser(args[0]))
+	}
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		os.Exit(runCommand(args[0], args[1:]))
 	}
@@ -552,7 +584,7 @@ func main() {
 func serve(args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := flags.Int("port", envInt("LIMITBREAK_PORT", defaultPort), "port to listen on (loopback only)")
-	upstream := flags.String("upstream", envString("LIMITBREAK_UPSTREAM", "https://api.anthropic.com"), "Anthropic API address")
+	upstream := flags.String("upstream", envString("LIMITBREAK_UPSTREAM", defaultUpstream), "Anthropic API address")
 	home, _ := os.UserHomeDir()
 	homeFlag := flags.String("home", home, "home dir holding the Claude logins")
 	credentials := flags.String("credentials", "auto", "auto, keychain or file")
@@ -562,7 +594,9 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	log.Printf("limitbreak listening on http://%s", listener.Addr())
-	log.Fatal(http.Serve(listener, newProxy(newAccounts(*homeFlag, *credentials, ""), *upstream)))
+	a := newAccounts(*homeFlag, *credentials, "")
+	go newAuthWatch(a, notifyDesktop).run()
+	log.Fatal(http.Serve(listener, newProxy(a, *upstream)))
 }
 
 func envString(name, fallback string) string {

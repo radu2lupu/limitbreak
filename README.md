@@ -35,7 +35,7 @@ Open a new terminal and run `claude` as usual. When one account's limit is hit, 
 
 - Only `/v1/messages*` requests are sent on an account's token. Everything else (claude.ai connectors, MCP, artifacts, profile) goes through untouched with Claude Code's own credentials, so those keep working.
 - It never sets `CLAUDE_CODE_OAUTH_TOKEN` (that makes Claude Code drop its connectors and local MCP servers).
-- Accounts are the logins Claude Code already holds: the default one plus every `~/.claude-<name>` config directory that has a login. Tokens are read from the macOS Keychain item Claude Code keeps per config dir, or from `<dir>/.credentials.json`. They are never copied, logged, or exposed by `GET /_status`.
+- Accounts are the logins Claude Code already holds: the default one plus every `~/.claude-<name>` config directory that has a login. An account's token is its 1-year token from `limitbreak renew` when it has one, else the sign-in token read from the macOS Keychain item Claude Code keeps per config dir, or from `<dir>/.credentials.json`. Tokens are never logged or exposed by `GET /_status`, and sign-in tokens are never copied.
 - An expired token is refreshed by running one tiny `claude -p` under that account's directory, so Claude Code stays the only thing that refreshes a login.
 - If no account can serve a request, it passes through with Claude Code's own login: never worse than no proxy.
 - Only a window rejection (`429` with `anthropic-ratelimit-unified-status: rejected`) switches accounts. Ordinary rate limits go back to Claude unchanged.
@@ -70,6 +70,22 @@ limitbreak remove work    # sign it out and delete its login from this machine
 `add` runs Claude Code's own browser sign-in into its own config directory (`~/.claude-<name>`), checks the login landed, tells you which email it is, and warns if you added the same account twice. The running proxy picks it up within 30 seconds; no restart. The default account is whatever plain `claude auth login` signs in. Raw status for scripts: `curl -s http://127.0.0.1:48617/_status`.
 
 Every switch is logged (`~/Library/Logs/limitbreak.log` on macOS, the journal on Linux): the account that ran out, when it resets, and the one now serving.
+
+`limitbreak list` also shows the latest usage headers observed for each account, with their observation time. The proxy stores these snapshots in `~/.local/state/limitbreak/usage.json`; they survive restarts. Values are only as fresh as the last response for that account and may be absent if Anthropic did not send them. The headers are undocumented and may change.
+
+### Logins that renew themselves
+
+A Claude sign-in ends about 30 days after `claude auth login`, and refreshing does not move that date. To stop signing in every account once a month, run this once:
+
+```sh
+limitbreak renew          # every account without a 1-year token (or one ending within 30 days)
+limitbreak renew work     # just this one
+limitbreak renew --all    # every account, even those with a fresh token
+```
+
+For each account it runs Claude Code's `claude setup-token` and you authorize once in the browser. The sign-in page opens with the account's email already filled in (as `claude auth login --email` does). If the browser is already signed in to claude.ai as someone else, that session may win, so check it matches the email `renew` prints. Each account then gets a 1-year token, kept in the Keychain (item `limitbreak-token`) on macOS or in `<dir>/.limitbreak-token.json` (mode 600) elsewhere. The proxy uses it in place of the sign-in.
+
+`limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
 
 ## Options
 

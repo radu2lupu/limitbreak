@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,9 @@ import (
 
 const usage = `limitbreak [serve flags]        run the proxy (default)
 limitbreak add [name]           sign in a new account (opens the browser)
-limitbreak list                 show the accounts
+limitbreak list                 show the accounts and when each one's login ends
+limitbreak renew [name...] [--all]
+                                give accounts a 1-year token (one browser authorization each)
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak video                watch a switch happen as an arcade battle (simulated, no real login touched)
 
@@ -46,6 +49,8 @@ func runCommand(command string, args []string) int {
 		err = runVideo(os.Stdout)
 	case "list":
 		listAccounts(a, os.Stdout)
+	case "renew":
+		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
 	case "remove":
 		err = removeAccount(a, args, os.Stdin, os.Stdout)
 	default:
@@ -162,6 +167,9 @@ func listAccounts(a *accounts, out io.Writer) {
 			email = "(email unknown)"
 		}
 		fmt.Fprintf(out, "%s %-16s %s\n", mark, acc.ID, email)
+		end, kind := a.authInfo(acc)
+		fmt.Fprintf(out, "    auth: %s\n", authLine(acc.ID, end, kind, a.now()))
+		showUsage(out, a.home, acc)
 	}
 	if active == "" {
 		fmt.Fprintln(out, "(proxy not running: start it with the installed service, or `limitbreak`)")
@@ -235,9 +243,281 @@ func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) erro
 			_ = exec.Command("security", args...).Run()
 		}
 	}
+	if err := a.deleteLongToken(*target); err != nil {
+		return err
+	}
 	if err := os.RemoveAll(target.Dir); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Removed %s.\n", name)
 	return nil
+}
+
+// MARK: Renew
+
+// A 1-year token as `claude setup-token` prints it.
+var (
+	longTokenPattern = regexp.MustCompile(`sk-ant-oat01-[A-Za-z0-9_-]+`)
+	tokenContinued   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	// Terminal escapes in a typescript: CSI (colors, cursor moves), OSC (titles, links), charset
+	// designations, and any other two-byte escape. Order matters: the longer forms first.
+	terminalEscape = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()*+].|\x1b.`)
+	controlChars   = regexp.MustCompile(`[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`)
+	lineBreaks     = regexp.MustCompile(`\r*\n|\r`)
+)
+
+// extractToken is the last 1-year token in a terminal recording of `claude setup-token`; empty
+// when there is none. The TUI may wrap a long token over several lines, so a token that runs to
+// the end of its line takes the following lines as long as each one is nothing but token
+// characters. It stops at a blank line, at prose (anything with a space or punctuation), and at the
+// start of another token, so a wrong join is unlikely; a truncated or joined token would still be
+// caught by the validation that follows, and never stored.
+func extractToken(typescript string) string {
+	clean := terminalEscape.ReplaceAllStringFunc(typescript, func(seq string) string {
+		if strings.HasPrefix(seq, "\x1b[") && strings.HasSuffix(seq, "C") {
+			return " " // cursor forward stands in for spaces
+		}
+		return ""
+	})
+	clean = controlChars.ReplaceAllString(clean, "")
+	lines := lineBreaks.Split(clean, -1)
+	found := ""
+	for i, line := range lines {
+		for _, m := range longTokenPattern.FindAllStringIndex(line, -1) {
+			token := line[m[0]:m[1]]
+			if strings.TrimRight(line[m[1]:], " \t") == "" {
+				for _, next := range lines[i+1:] {
+					more := strings.TrimSpace(next)
+					if !tokenContinued.MatchString(more) || strings.Contains(more, "sk-ant-") {
+						break
+					}
+					token += more
+				}
+			}
+			found = token
+		}
+	}
+	return found
+}
+
+// scriptCommand runs `claude setup-token` under script(1), which gives it a real terminal (it is
+// an interactive TUI) and records everything it prints, so the token can be read back.
+func scriptCommand(goos, claude, typescript string) []string {
+	if goos == "darwin" {
+		return []string{"script", "-q", typescript, claude, "setup-token"}
+	}
+	return []string{"script", "-q", "-c", shellQuote(claude) + " setup-token", typescript}
+}
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// tokenRunner runs `claude setup-token` as the account, recording its terminal output into the
+// typescript file. Injected so renew is testable without a browser.
+type tokenRunner func(acc account, typescript string) error
+
+// tokenValidator asks Anthropic about a token and returns the HTTP status.
+type tokenValidator func(token string) (int, error)
+
+func setupTokenRunner(a *accounts) tokenRunner {
+	return func(acc account, typescript string) error {
+		if a.claude == "" {
+			return fmt.Errorf("claude is not on PATH; install Claude Code first")
+		}
+		args := scriptCommand(runtime.GOOS, a.claude, typescript)
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Env = claudeEnv(acc.Dir)
+		// Claude Code opens its sign-in page through $BROWSER. Pointing that at limitbreak lets it
+		// add the account's email as login_hint, as `claude auth login --email` does.
+		if self, err := os.Executable(); err == nil && acc.Email != "" {
+			cmd.Env = append(cmd.Env, "BROWSER="+self, loginHintEnv+"="+acc.Email)
+		}
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+}
+
+// countTokensValidator checks a token with the cheapest call that needs inference scope and spends
+// no usage.
+func countTokensValidator(upstream string) tokenValidator {
+	return func(token string) (int, error) {
+		body := `{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"ok"}]}`
+		req, err := http.NewRequest(http.MethodPost, strings.TrimRight(upstream, "/")+"/v1/messages/count_tokens", strings.NewReader(body))
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("anthropic-version", "2023-06-01")
+		req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err != nil {
+			return 0, err
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+}
+
+// renewAccounts gives accounts a 1-year token: named ones always, else every one that needs it
+// (needsRenew), or all of them with --all. One failing account does not stop the others.
+func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenValidator, out io.Writer) error {
+	all := false
+	var names []string
+	for _, arg := range args {
+		switch {
+		case arg == "--all" || arg == "-all":
+			all = true
+		case strings.HasPrefix(arg, "-"):
+			return fmt.Errorf("usage: limitbreak renew [name...] [--all]")
+		default:
+			names = append(names, arg)
+		}
+	}
+	list := freshAccounts(a)
+	var targets []account
+	failed := map[string]string{}
+	var failedOrder []string
+	fail := func(id, reason string) {
+		failed[id] = reason
+		failedOrder = append(failedOrder, id)
+	}
+	if len(names) > 0 {
+		byID := map[string]account{}
+		for _, acc := range list {
+			byID[acc.ID] = acc
+		}
+		for _, name := range names {
+			acc, ok := byID[name]
+			if !ok {
+				fail(name, "no such account")
+				continue
+			}
+			targets = append(targets, acc)
+		}
+	} else {
+		now := a.now()
+		for _, acc := range list {
+			end, kind := a.authInfo(acc)
+			if all || needsRenew(end, kind, now) {
+				targets = append(targets, acc)
+				continue
+			}
+			fmt.Fprintf(out, "%s has a 1-year token until %s; skipped (--all renews it anyway).\n", acc.ID, day(end))
+		}
+	}
+	if len(list) == 0 && len(names) == 0 {
+		fmt.Fprintln(out, "No accounts signed in. Run `claude auth login` (default) or `limitbreak add`.")
+		return nil
+	}
+	var renewed []string
+	for _, acc := range targets {
+		if err := renewOne(a, acc, run, validate, out); err != nil {
+			fmt.Fprintf(out, "%s not renewed: %v\n", acc.ID, err)
+			fail(acc.ID, err.Error())
+			continue
+		}
+		renewed = append(renewed, acc.ID)
+	}
+	if len(renewed) > 0 {
+		fmt.Fprintf(out, "Renewed: %s.\n", strings.Join(renewed, ", "))
+	} else if len(failedOrder) == 0 {
+		fmt.Fprintln(out, "Nothing to renew.")
+	}
+	if len(failedOrder) > 0 {
+		var parts []string
+		for _, id := range failedOrder {
+			parts = append(parts, id+" ("+failed[id]+")")
+		}
+		fmt.Fprintf(out, "Failed: %s.\n", strings.Join(parts, "; "))
+		return fmt.Errorf("%d account(s) not renewed", len(failedOrder))
+	}
+	return nil
+}
+
+func renewOne(a *accounts, acc account, run tokenRunner, validate tokenValidator, out io.Writer) error {
+	email, who := acc.Email, acc.Email
+	if email == "" {
+		email, who = "email unknown", "the account you want for "+acc.ID
+	}
+	fmt.Fprintf(out, "Renewing %s (%s). In the browser, make sure claude.ai is signed in as %s, then authorize.\n", acc.ID, email, who)
+	token, runErr := captureToken(acc, run)
+	if token == "" {
+		if runErr != nil {
+			return fmt.Errorf("claude setup-token: %w", runErr)
+		}
+		return fmt.Errorf("no token in claude setup-token's output")
+	}
+	status, err := validate(token)
+	switch {
+	case err != nil:
+		fmt.Fprintf(out, "Warning: could not check the new token (%v); storing it anyway.\n", err)
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return fmt.Errorf("Anthropic rejected the new token (HTTP %d); not stored", status)
+	case status != http.StatusOK:
+		fmt.Fprintf(out, "Warning: checking the new token answered HTTP %d; storing it anyway.\n", status)
+	}
+	t := newLongToken(token, a.now())
+	if err := a.writeLongToken(acc, t); err != nil {
+		return fmt.Errorf("storing the token: %w", err)
+	}
+	fmt.Fprintf(out, "%s now has a 1-year token until %s.\n", acc.ID, day(time.UnixMilli(t.ExpiresAt)))
+	return nil
+}
+
+// captureToken runs setup-token into a typescript in a private temp dir and deletes it as soon as
+// it is read: the recording holds the token in the clear.
+func captureToken(acc account, run tokenRunner) (string, error) {
+	dir, err := os.MkdirTemp("", "limitbreak-renew-") // 0700
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "typescript")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	f.Close()
+	runErr := run(acc, path)
+	raw, _ := os.ReadFile(path)
+	_ = os.RemoveAll(dir)
+	return extractToken(string(raw)), runErr
+}
+
+// loginHintEnv carries the account's email to limitbreak running as $BROWSER during renew.
+const loginHintEnv = "LIMITBREAK_LOGIN_HINT"
+
+// withLoginHint adds login_hint=email to a Claude sign-in link that has none, so the sign-in page
+// starts on that account. Any other link, or no email, comes back unchanged.
+func withLoginHint(raw, email string) string {
+	u, err := url.Parse(raw)
+	if err != nil || email == "" || !strings.Contains(u.Path, "oauth/authorize") {
+		return raw
+	}
+	host := u.Hostname()
+	if !(host == "claude.com" || host == "claude.ai" || strings.HasSuffix(host, ".claude.com") || strings.HasSuffix(host, ".claude.ai")) {
+		return raw
+	}
+	q := u.Query()
+	if q.Get("login_hint") != "" {
+		return raw
+	}
+	q.Set("login_hint", email)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// openBrowser is limitbreak acting as $BROWSER for `claude setup-token`: it opens the link with
+// the login hint added.
+func openBrowser(link string) int {
+	opener := "xdg-open"
+	if runtime.GOOS == "darwin" {
+		opener = "open"
+	}
+	if err := exec.Command(opener, withLoginHint(link, os.Getenv(loginHintEnv))).Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	return 0
 }
