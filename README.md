@@ -25,7 +25,7 @@ Try it without touching any real login: `limitbreak video` plays a simulated swi
 ```sh
 git clone https://github.com/radu2lupu/limitbreak && cd limitbreak
 ./install.sh                                   # builds and starts the background service
-echo 'source "$HOME/.local/bin/limitbreak-shell.sh"' >> ~/.zshrc   # or ~/.bashrc
+echo 'source "$HOME/.local/bin/limitbreak-shell.sh"' >> ~/.zshenv  # or ~/.bashrc
 limitbreak add                       # sign in another account (browser), repeat per account
 ```
 
@@ -50,7 +50,7 @@ cd limitbreak
 ./install.sh          # builds, installs ~/.local/bin/limitbreak, starts a launchd / systemd user service
 ```
 
-Then add the printed line to `~/.zshrc` or `~/.bashrc`:
+Then add the printed line to `~/.zshenv` (zsh reads it for every shell, including `ssh host claude -p …`) or `~/.bashrc`:
 
 ```sh
 source "$HOME/.local/bin/limitbreak-shell.sh"
@@ -99,7 +99,7 @@ A request path may begin with `/_c/<client>/` to give a client (an agent, a tool
 
 - **Terms of service.** This uses the official `claude` binary with accounts you own, but spreading load across subscription accounts may conflict with Anthropic's terms for your plan. Read them; you are responsible for your use. Not affiliated with or endorsed by Anthropic.
 - **Don't copy a login between machines.** Refresh tokens rotate; two machines holding the same one will log each other out. Sign in once per machine.
-- **Headless hosts.** On macOS over SSH the Keychain is locked; run the proxy as a user service in the login session (what `install.sh` does).
+- **Headless hosts.** On macOS over SSH the Keychain is locked, so Claude Code cannot read its own sign-in. Run the proxy as a user service in the login session (what `install.sh` does); over SSH the `claude` function then passes a placeholder bearer token that the proxy replaces with the account's token, so `ssh host claude -p …` works on the subscription. Such a session has no claude.ai connectors, and fails if no account can serve the request.
 - The reset time is read from Anthropic's response headers, which are not a documented contract and may change.
 
 ## Uninstall
