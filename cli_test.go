@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -26,7 +27,7 @@ func signIn(t *testing.T, email string) func(dir string) error {
 
 func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "account-1": "t-one"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	var out bytes.Buffer
 	if err := addAccount(a, "", signIn(t, "new@example.com"), &out); err != nil {
 		t.Fatal(err)
@@ -34,7 +35,7 @@ func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 	if !strings.Contains(out.String(), "Added account-2 (new@example.com). 3 accounts now.") {
 		t.Fatal(out.String())
 	}
-	if len(freshAccounts(a)) != 3 {
+	if len(a.list()) != 3 {
 		t.Fatal("the new login is not discovered")
 	}
 }
@@ -42,7 +43,7 @@ func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 func TestAddWarnsWhenTheSameLoginIsAddedTwice(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default"})
 	var out bytes.Buffer
-	if err := addAccount(newAccounts(home, credentialsFile, ""), "again", signIn(t, "default@example.com"), &out); err != nil {
+	if err := addAccount(newClaudeAccounts(home, credentialsFile, ""), "again", signIn(t, "default@example.com"), &out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "same login") {
@@ -52,7 +53,7 @@ func TestAddWarnsWhenTheSameLoginIsAddedTwice(t *testing.T) {
 
 func TestAddRefusesBadNamesAndCleansUpAFailedSignIn(t *testing.T) {
 	home := t.TempDir()
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	for _, name := range []string{"default", "../x", "a b"} {
 		if err := addAccount(a, name, signIn(t, "x@example.com"), &bytes.Buffer{}); err == nil {
 			t.Fatalf("%q accepted", name)
@@ -73,12 +74,12 @@ func TestAddRefusesBadNamesAndCleansUpAFailedSignIn(t *testing.T) {
 
 func TestRemoveDeletesTheLoginAfterConfirmationAndNeverTheDefault(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	var out bytes.Buffer
 	if err := removeAccount(a, []string{"work"}, strings.NewReader("n\n"), &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(freshAccounts(a)) != 2 {
+	if len(a.list()) != 2 {
 		t.Fatal("removed without confirmation")
 	}
 	if err := removeAccount(a, []string{"default", "-y"}, strings.NewReader(""), &out); err == nil {
@@ -87,14 +88,14 @@ func TestRemoveDeletesTheLoginAfterConfirmationAndNeverTheDefault(t *testing.T) 
 	if err := removeAccount(a, []string{"work"}, strings.NewReader("y\n"), &out); err != nil {
 		t.Fatal(err)
 	}
-	if list := freshAccounts(a); len(list) != 1 || list[0].ID != "default" {
+	if list := a.list(); len(list) != 1 || list[0].ID != "default" {
 		t.Fatal(list)
 	}
 }
 
 func TestListMarksTheActiveAccountFromStatus(t *testing.T) {
 	raw := []byte(`[{"id":"default","spentUntil":null,"activeFor":[]},{"id":"work","spentUntil":null,"activeFor":["shared"]}]`)
-	if activeFromStatus(raw) != "work" {
+	if activeFromStatus(raw)["claude"] != "work" {
 		t.Fatal("active not read")
 	}
 }
@@ -118,7 +119,7 @@ func (f *fakeSetupToken) run(acc account, typescript string) error {
 
 func TestRenewSkipsFreshTokensUnlessAllAndNeverStoresARejectedOne(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work", "spare": "t-spare"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	if err := a.writeLongToken(accountNamed(t, a, "default"), newLongToken("sk-ant-oat01-fresh", time.Now())); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +180,7 @@ func TestRenewSkipsFreshTokensUnlessAllAndNeverStoresARejectedOne(t *testing.T) 
 
 func TestRemoveAlsoDeletesTheLongToken(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	work := accountNamed(t, a, "work")
 	a.writeLongToken(work, newLongToken("sk-ant-oat01-x", time.Now()))
 	if err := removeAccount(a, []string{"work", "-y"}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
@@ -230,8 +231,8 @@ func TestWithLoginHint(t *testing.T) {
 }
 
 func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
-	src := newAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
-	dst := newAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
+	src := newClaudeAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
+	dst := newClaudeAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
 	now := time.Now()
 	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
 	src.writeLongToken(accountNamed(t, src, "spare"), newLongToken("sk-ant-oat01-spare", now))
@@ -272,12 +273,223 @@ func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
 
 func TestKeychainModeAlsoReadsTheTokenFile(t *testing.T) {
 	home := makeHome(t, map[string]string{"work": "y"})
-	file := newAccounts(home, credentialsFile, "")
+	file := newClaudeAccounts(home, credentialsFile, "")
 	acc := accountNamed(t, file, "work")
 	acc.ID = "limitbreak-test-absent-" + strings.ReplaceAll(t.Name(), "/", "-") // never in the real Keychain
 	file.writeLongToken(acc, newLongToken("sk-ant-oat01-file", time.Now()))
-	kc := newAccounts(home, credentialsKeychain, "")
+	kc := newClaudeAccounts(home, credentialsKeychain, "")
 	if got, ok := kc.readLongToken(acc); !ok || got.Token != "sk-ant-oat01-file" {
 		t.Fatal(got, ok)
+	}
+}
+
+// events reads `--json` output: one event per line.
+func events(t *testing.T, out string) []loginEvent {
+	t.Helper()
+	var list []loginEvent
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var e loginEvent
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("not one JSON event per line: %q", out)
+		}
+		list = append(list, e)
+	}
+	return list
+}
+
+func kinds(list []loginEvent) string {
+	var k []string
+	for _, e := range list {
+		k = append(k, e.Event)
+	}
+	return strings.Join(k, ",")
+}
+
+// fakeCodexLogin stands in for `codex login`: it prints Codex's sign-in text, asks for a pasted
+// code, and leaves a ChatGPT sign-in in the dir when given the right one.
+func fakeCodexLogin(t *testing.T, name, accountID string) loginRunner {
+	return func(dir string, output io.Writer, codes <-chan string) error {
+		io.WriteString(output, "Starting local login server on http://localhost:1455.\nIf your browser did not open, navigate to this URL to authenticate:\n\n")
+		io.WriteString(output, "https://auth.openai.com/oauth/authorize?client_id=app_x&state=abc\n\n")
+		io.WriteString(output, "\x1b[1mPaste the authorization code here\x1b[0m > ")
+		if code := <-codes; code != "the-code" {
+			return fmt.Errorf("code %q", code)
+		}
+		writeCodexLogin(t, dir, name, accountID, time.Now().Add(240*time.Hour))
+		io.WriteString(output, "\nSuccessfully logged in\n")
+		return nil
+	}
+}
+
+func TestAddJSONReportsTheSignInAsEventsAndPassesAPastedCode(t *testing.T) {
+	home := t.TempDir()
+	writeCodexLogin(t, filepath.Join(home, ".codex"), "me", "acct-me", time.Now().Add(240*time.Hour))
+	codex := newCodexAccounts(home, "", "")
+	var out bytes.Buffer
+	if err := addAccountJSON(codex, "work", fakeCodexLogin(t, "new", "acct-new"), strings.NewReader("the-code\n"), &out); err != nil {
+		t.Fatal(err, out.String())
+	}
+	list := events(t, out.String())
+	if kinds(list) != "open_url,need_code,added" || list[0].URL != "https://auth.openai.com/oauth/authorize?client_id=app_x&state=abc" {
+		t.Fatal(out.String())
+	}
+	if added := list[2]; added.Provider != "codex" || added.ID != "work" || added.Email != "new@example.com" || added.SameAs != "" {
+		t.Fatalf("%+v", added)
+	}
+	if !strings.Contains(out.String(), `{"event":"added","provider":"codex","id":"work","email":"new@example.com"}`) {
+		t.Fatal(out.String())
+	}
+
+	// The same ChatGPT user and workspace again adds no capacity, and says so.
+	out.Reset()
+	if err := addAccountJSON(codex, "", fakeCodexLogin(t, "me", "acct-me"), strings.NewReader("the-code\n"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if last := events(t, out.String())[2]; last.ID != "account-1" || last.SameAs != "default" {
+		t.Fatalf("%+v", last)
+	}
+}
+
+func TestAddJSONEndsWithAnErrorEventAndLeavesNoDir(t *testing.T) {
+	home := t.TempDir()
+	codex := newCodexAccounts(home, "", "")
+	var out bytes.Buffer
+	noLogin := func(string, io.Writer, <-chan string) error { return nil }
+	if err := addAccountJSON(codex, "work", noLogin, strings.NewReader(""), &out); err == nil {
+		t.Fatal("a sign-in without a login reported as added")
+	}
+	if list := events(t, out.String()); kinds(list) != "error" || !strings.Contains(list[0].Message, "no login found") {
+		t.Fatal(out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex-work")); !os.IsNotExist(err) {
+		t.Fatal("dir left behind")
+	}
+	out.Reset()
+	addAccountJSON(codex, "default", noLogin, strings.NewReader(""), &out)
+	if list := events(t, out.String()); kinds(list) != "error" || !strings.Contains(list[0].Message, `plain "codex login"`) {
+		t.Fatal(out.String())
+	}
+}
+
+func TestAddJSONWorksForClaudeToo(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "t-default"})
+	a := newClaudeAccounts(home, credentialsFile, "")
+	claudeLogin := func(dir string, output io.Writer, _ <-chan string) error {
+		io.WriteString(output, "Opening browser to sign in…\nIf the browser didn't open, visit: https://claude.com/cai/oauth/authorize?code=true\n")
+		return signIn(t, "work@example.com")(dir)
+	}
+	var out bytes.Buffer
+	if err := addAccountJSON(a, "work", claudeLogin, strings.NewReader(""), &out); err != nil {
+		t.Fatal(err)
+	}
+	list := events(t, out.String())
+	if kinds(list) != "open_url,added" || list[0].URL != "https://claude.com/cai/oauth/authorize?code=true" || list[1].Provider != "claude" || list[1].Email != "work@example.com" {
+		t.Fatal(out.String())
+	}
+}
+
+func TestLoginWatchReportsADeviceCode(t *testing.T) {
+	var got []loginEvent
+	w := &loginWatch{emit: func(e loginEvent) { got = append(got, e) }, answers: bufio.NewReader(strings.NewReader(""))}
+	io.WriteString(w, "Follow these steps to sign in with ChatGPT using device code authorization:\n\n1. Open this link in your browser and sign in to your account\n   \x1b[94mhttps://auth.openai.com/codex/device\x1b[0m\n\n")
+	io.WriteString(w, "2. Enter this one-time code \x1b[90m(expires in 15 minutes)\x1b[0m\n   \x1b[94mABCD-12345\x1b[0m\n")
+	if kinds(got) != "open_url,device_code" || got[0].URL != "https://auth.openai.com/codex/device" || got[1].Code != "ABCD-12345" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+func TestRemoveJSONNeedsYesAndReportsTheRemoval(t *testing.T) {
+	home := t.TempDir()
+	writeCodexLogin(t, filepath.Join(home, ".codex"), "me", "acct-me", time.Now().Add(time.Hour))
+	writeCodexLogin(t, filepath.Join(home, ".codex-work"), "work", "acct-work", time.Now().Add(time.Hour))
+	codex := newCodexAccounts(home, "", "")
+	var out bytes.Buffer
+	for _, args := range [][]string{{"work"}, {"default", "--yes"}, {"nobody", "--yes"}} {
+		out.Reset()
+		if removeAccountJSON(codex, args, &out) == nil || kinds(events(t, out.String())) != "error" {
+			t.Fatal(args, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "no account named") {
+		t.Fatal(out.String())
+	}
+	out.Reset()
+	if err := removeAccountJSON(codex, []string{"work", "--yes"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out.String()) != `{"event":"removed","provider":"codex","id":"work","email":"work@example.com"}` {
+		t.Fatal(out.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex-work", "auth.json")); !os.IsNotExist(err) {
+		t.Fatal("login left behind")
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "auth.json")); err != nil {
+		t.Fatal("the default login was touched")
+	}
+}
+
+func TestAccountFlags(t *testing.T) {
+	p, asJSON, rest, err := accountFlags([]string{"--provider", "codex", "work", "--json", "--yes"})
+	if err != nil || p != "codex" || !asJSON || strings.Join(rest, " ") != "work --yes" {
+		t.Fatal(p, asJSON, rest, err)
+	}
+	p, asJSON, rest, _ = accountFlags([]string{"work", "-y"})
+	if p != "claude" || asJSON || strings.Join(rest, " ") != "work -y" {
+		t.Fatal("without flags add and remove are as they were", p, asJSON, rest)
+	}
+	if p, _, _, _ = accountFlags([]string{"--provider=codex"}); p != "codex" {
+		t.Fatal(p)
+	}
+	if _, _, _, err = accountFlags([]string{"--provider"}); err == nil {
+		t.Fatal("a missing provider accepted")
+	}
+}
+
+func TestAddRefusesAnotherToolsDirAndCodexRemoveKeepsWhatItDidNotMake(t *testing.T) {
+	home := t.TempDir()
+	chief := filepath.Join(home, ".codex-chief")
+	if err := os.MkdirAll(chief, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(chief, "chief.sqlite"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &codexAccounts{home: home}
+	if _, _, _, err := prepareAdd(a, "chief"); err == nil {
+		t.Fatal("add signed into another tool's dir")
+	}
+	if _, err := os.Stat(filepath.Join(chief, "chief.sqlite")); err != nil {
+		t.Fatal("refused add touched the dir")
+	}
+
+	// A login dir that was already there before Limit Break (like ~/.codex-planner): remove
+	// deletes its auth.json and keeps everything else.
+	planner := filepath.Join(home, ".codex-planner")
+	if err := os.MkdirAll(filepath.Join(planner, "log"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planner, "auth.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.forget(account{ID: "planner", Dir: planner}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(planner, "auth.json")); !os.IsNotExist(err) {
+		t.Fatal("auth.json survived remove")
+	}
+	if _, err := os.Stat(filepath.Join(planner, "log")); err != nil {
+		t.Fatal("remove deleted a dir Limit Break did not make")
+	}
+
+	// A dir Limit Break made goes whole.
+	_, made, created, err := prepareAdd(a, "fresh")
+	if err != nil || !created {
+		t.Fatalf("prepareAdd fresh: created=%v err=%v", created, err)
+	}
+	if err := a.forget(account{ID: "fresh", Dir: made}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(made); !os.IsNotExist(err) {
+		t.Fatal("a dir Limit Break made survived remove")
 	}
 }

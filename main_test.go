@@ -84,12 +84,13 @@ func newUpstream(t *testing.T, spent ...string) *upstream {
 	return u
 }
 
-func start(t *testing.T, home string, up *upstream) (*httptest.Server, *accounts) {
-	acc := newAccounts(home, credentialsFile, "")
+func start(t *testing.T, home string, up *upstream) (*httptest.Server, *pool) {
+	acc := newClaudeAccounts(home, credentialsFile, "")
 	acc.claude = ""
-	server := httptest.NewServer(newProxy(acc, up.URL))
+	claude := newPool(acc, up.URL)
+	server := httptest.NewServer(newProxy(claude))
 	t.Cleanup(server.Close)
-	return server, acc
+	return server, claude
 }
 
 func post(t *testing.T, base, path string) (int, string) {
@@ -173,7 +174,7 @@ func TestNextAccountSkipsSpentAndIsNilWhenAllAreSpent(t *testing.T) {
 func TestAccountsAreTheDefaultAndEveryDotClaudeDirWithALogin(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
 	os.MkdirAll(filepath.Join(home, ".claude-empty"), 0o755)
-	list := newAccounts(home, credentialsFile, "").list()
+	list := newClaudeAccounts(home, credentialsFile, "").list()
 	if len(list) != 2 || list[0].ID != "default" || list[1].ID != "work" || list[1].Email != "work@example.com" {
 		t.Fatal(list)
 	}
@@ -360,8 +361,8 @@ func TestStatusCarriesUsageAndAuthEndWithoutTokens(t *testing.T) {
 	h := http.Header{}
 	h.Set("anthropic-ratelimit-unified-7d-utilization", "0.42")
 	h.Set("anthropic-ratelimit-unified-5h-reset", "1800000000")
-	acc.recordUsage(account{ID: "work", Email: "work@example.com"}, h)
-	acc.recordUsage(account{ID: "default", Email: "someone-else@example.com"}, h)
+	acc.provider.(*claudeAccounts).recordUsage(account{ID: "work", Email: "work@example.com"}, h)
+	acc.provider.(*claudeAccounts).recordUsage(account{ID: "default", Email: "someone-else@example.com"}, h)
 
 	resp, err := http.Get(server.URL + "/_status")
 	if err != nil {
