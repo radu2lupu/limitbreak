@@ -495,3 +495,35 @@ func TestCodexDiscoveryTakesChatGPTSignInsOnly(t *testing.T) {
 		t.Fatalf("%+v", list)
 	}
 }
+
+// A second sign-in to the same ChatGPT login (~/.codex-planner beside ~/.codex) shares its window:
+// it is listed with sameAs, never rotated to, never made active, and its usage is not asked for.
+func TestSecondSignInToTheSameSubscriptionIsNeverRotatedTo(t *testing.T) {
+	home := t.TempDir()
+	writeCodexLogin(t, filepath.Join(home, ".codex"), "me", "acct-me", time.Now().Add(time.Hour))
+	writeCodexLogin(t, filepath.Join(home, ".codex-planner"), "me", "acct-me", time.Now().Add(-time.Hour))
+	writeCodexLogin(t, filepath.Join(home, ".codex-work"), "work", "acct-work", time.Now().Add(time.Hour))
+	p := newPool(newCodexAccounts(home, "", ""), "http://127.0.0.1:1")
+
+	if got := p.current("c"); got == nil || got.ID != defaultID {
+		t.Fatalf("current = %v, want default", got)
+	}
+	if next := p.spend("c", defaultID, time.Now().Add(time.Hour)); next == nil || next.ID != "work" {
+		t.Fatalf("after default is spent: %v, want work (planner is the same subscription)", next)
+	}
+	if next := p.spend("c", "work", time.Now().Add(time.Hour)); next != nil {
+		t.Fatalf("after work is spent: %v, want none", next.ID)
+	}
+	if p.setActive("c", "planner") {
+		t.Fatal("planner was made active")
+	}
+	for _, s := range p.status() {
+		want := ""
+		if s.ID == "planner" {
+			want = defaultID
+		}
+		if s.SameAs != want {
+			t.Fatalf("%s sameAs = %q, want %q", s.ID, s.SameAs, want)
+		}
+	}
+}

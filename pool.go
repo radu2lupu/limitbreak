@@ -74,10 +74,45 @@ func (p *pool) list() []account {
 	return append([]account(nil), found...)
 }
 
+// rotation is the list without second sign-ins to a subscription already on it (same Who): they share
+// its usage window, so moving to one gains nothing, and refreshing one can rotate a token another
+// tool (or Codex itself) holds. The first one, default first then by name, stays.
+func rotation(list []account) []account {
+	seen := map[string]bool{}
+	out := make([]account, 0, len(list))
+	for _, acc := range list {
+		if acc.Who != "" {
+			if seen[acc.Who] {
+				continue
+			}
+			seen[acc.Who] = true
+		}
+		out = append(out, acc)
+	}
+	return out
+}
+
+// sameAs names, for each second sign-in, the account it duplicates.
+func sameAs(list []account) map[string]string {
+	first := map[string]string{}
+	dup := map[string]string{}
+	for _, acc := range list {
+		if acc.Who == "" {
+			continue
+		}
+		if id, ok := first[acc.Who]; ok {
+			dup[acc.ID] = id
+		} else {
+			first[acc.Who] = acc.ID
+		}
+	}
+	return dup
+}
+
 // current is the client's active account, moving on from a spent one; nil when none is signed in
 // or all are spent.
 func (p *pool) current(client string) *account {
-	list := p.list()
+	list := rotation(p.list())
 	if len(list) == 0 {
 		return nil
 	}
@@ -99,7 +134,7 @@ func (p *pool) current(client string) *account {
 
 // spend records the account spent until `until` (an hour when zero) and returns the next usable one.
 func (p *pool) spend(client, id string, until time.Time) *account {
-	list := p.list()
+	list := rotation(p.list())
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
@@ -118,9 +153,10 @@ func (p *pool) spend(client, id string, until time.Time) *account {
 	return usable
 }
 
-// setActive makes id the client's active account; false when no account has that id.
+// setActive makes id the client's active account; false when no account has that id or it is a
+// second sign-in to a subscription already listed (see rotation).
 func (p *pool) setActive(client, id string) bool {
-	for _, acc := range p.list() {
+	for _, acc := range rotation(p.list()) {
 		if acc.ID == id {
 			p.mu.Lock()
 			p.active[client] = id
@@ -149,16 +185,20 @@ type accountStatus struct {
 	Usage map[string]usageValue `json:"usage,omitempty"`
 	// Windows are the account's usage windows, the same shape for every provider.
 	Windows []usageWindow `json:"windows"`
+	// SameAs is the account this one is a second sign-in to (same subscription); it is never rotated to.
+	SameAs string `json:"sameAs,omitempty"`
 }
 
 func (p *pool) status() []accountStatus {
 	list := p.list()
+	dups := sameAs(list)
 	p.mu.Lock()
 	now := p.now()
 	out := []accountStatus{}
 	for _, acc := range list {
 		s := accountStatus{ID: acc.ID, Provider: p.provider.name(), Email: acc.Email, Label: accountLabel(acc), Plan: acc.Plan,
 			ActiveFor: []string{}, Windows: []usageWindow{}}
+		s.SameAs = dups[acc.ID]
 		if until := p.spentUntil[acc.ID]; until.After(now) {
 			unix := until.Unix()
 			s.SpentUntil = &unix
@@ -178,6 +218,9 @@ func (p *pool) status() []accountStatus {
 	p.mu.Unlock()
 	// Usage may be read from disk (or, for some providers, asked for), so not under the lock.
 	for i, acc := range list {
+		if dups[acc.ID] != "" {
+			continue // its usage is the first sign-in's; asking with a stale login only gets a 401
+		}
 		values, windows := p.provider.usage(acc)
 		out[i].Usage = values
 		if windows != nil {
