@@ -51,7 +51,7 @@ func readUsage(home string) (map[string]usageRecord, error) {
 	return records, nil
 }
 
-func (a *accounts) recordUsage(acc account, h http.Header) {
+func (a *claudeAccounts) recordUsage(acc account, h http.Header) {
 	values := map[string]usageValue{}
 	for name, header := range usageHeaders {
 		value, err := strconv.ParseFloat(h.Get(header), 64)

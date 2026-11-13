@@ -36,7 +36,7 @@ func runCommand(command string, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	a := newAccounts(home, "auto", "")
+	a := newClaudeAccounts(home, "auto", "")
 	switch command {
 	case "serve":
 		serve(args)
@@ -70,14 +70,6 @@ func runCommand(command string, args []string) int {
 	return 0
 }
 
-// freshAccounts is the account list read now, not the cached one.
-func freshAccounts(a *accounts) []account {
-	a.mu.Lock()
-	a.discovered = nil
-	a.mu.Unlock()
-	return a.list()
-}
-
 // nextFreeName is account-N for the first N not taken.
 func nextFreeName(taken []account) string {
 	used := map[string]bool{}
@@ -92,7 +84,7 @@ func nextFreeName(taken []account) string {
 }
 
 // loginAs runs Claude Code's own browser sign-in into the config dir, with the terminal attached.
-func loginAs(a *accounts) func(dir string) error {
+func loginAs(a *claudeAccounts) func(dir string) error {
 	return func(dir string) error {
 		if a.claude == "" {
 			return fmt.Errorf("claude is not on PATH; install Claude Code first")
@@ -106,8 +98,8 @@ func loginAs(a *accounts) func(dir string) error {
 
 // addAccount signs a new login into ~/.claude-<name> (account-N when no name is given) and
 // reports who it is. login is injected so the flow is testable without a browser.
-func addAccount(a *accounts, name string, login func(dir string) error, out io.Writer) error {
-	existing := freshAccounts(a)
+func addAccount(a *claudeAccounts, name string, login func(dir string) error, out io.Writer) error {
+	existing := a.list()
 	if name == "" {
 		name = nextFreeName(existing)
 	}
@@ -131,7 +123,7 @@ func addAccount(a *accounts, name string, login func(dir string) error, out io.W
 		return fmt.Errorf("sign-in failed: %w", err)
 	}
 	var added *account
-	list := freshAccounts(a)
+	list := a.list()
 	for i := range list {
 		if list[i].ID == name {
 			added = &list[i]
@@ -156,8 +148,8 @@ func addAccount(a *accounts, name string, login func(dir string) error, out io.W
 	return nil
 }
 
-func listAccounts(a *accounts, out io.Writer) {
-	list := freshAccounts(a)
+func listAccounts(a *claudeAccounts, out io.Writer) {
+	list := a.list()
 	if len(list) == 0 {
 		fmt.Fprintln(out, "No accounts signed in. Run `claude auth login` (default) or `limitbreak add`.")
 		return
@@ -209,7 +201,7 @@ func activeFromStatus(raw []byte) string {
 }
 
 // removeAccount deletes a non-default login: its config dir and, on macOS, its Keychain item.
-func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) error {
+func removeAccount(a *claudeAccounts, args []string, in io.Reader, out io.Writer) error {
 	yes := false
 	name := ""
 	for _, arg := range args {
@@ -226,7 +218,7 @@ func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) erro
 		return fmt.Errorf(`the default account is Claude Code's own login; sign out with "claude auth logout"`)
 	}
 	var target *account
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		if acc.ID == name {
 			acc := acc
 			target = &acc
@@ -324,7 +316,7 @@ type tokenRunner func(acc account, typescript string) error
 // tokenValidator asks Anthropic about a token and returns the HTTP status.
 type tokenValidator func(token string) (int, error)
 
-func setupTokenRunner(a *accounts) tokenRunner {
+func setupTokenRunner(a *claudeAccounts) tokenRunner {
 	return func(acc account, typescript string) error {
 		if a.claude == "" {
 			return fmt.Errorf("claude is not on PATH; install Claude Code first")
@@ -367,7 +359,7 @@ func countTokensValidator(upstream string) tokenValidator {
 
 // renewAccounts gives accounts a 1-year token: named ones always, else every one that needs it
 // (needsRenew), or all of them with --all. One failing account does not stop the others.
-func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenValidator, out io.Writer) error {
+func renewAccounts(a *claudeAccounts, args []string, run tokenRunner, validate tokenValidator, out io.Writer) error {
 	all := false
 	var names []string
 	for _, arg := range args {
@@ -380,7 +372,7 @@ func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenVa
 			names = append(names, arg)
 		}
 	}
-	list := freshAccounts(a)
+	list := a.list()
 	var targets []account
 	failed := map[string]string{}
 	var failedOrder []string
@@ -441,7 +433,7 @@ func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenVa
 	return nil
 }
 
-func renewOne(a *accounts, acc account, run tokenRunner, validate tokenValidator, out io.Writer) error {
+func renewOne(a *claudeAccounts, acc account, run tokenRunner, validate tokenValidator, out io.Writer) error {
 	email, who := acc.Email, acc.Email
 	if email == "" {
 		email, who = "email unknown", "the account you want for "+acc.ID
@@ -544,7 +536,7 @@ func sshImport(host, id string, record []byte) (string, error) {
 }
 
 // shareTokens copies every account's unexpired 1-year token to the same-named account on host.
-func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) error {
+func shareTokens(a *claudeAccounts, args []string, send remoteImport, out io.Writer) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return fmt.Errorf("usage: limitbreak share <ssh-host>")
 	}
@@ -552,7 +544,7 @@ func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) e
 	now := a.now()
 	var failed []string
 	shared := 0
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		t, ok := a.readLongToken(acc)
 		if !ok || !t.valid(now) {
 			fmt.Fprintf(out, "%s has no 1-year token; skipped (run limitbreak renew %s).\n", acc.ID, acc.ID)
@@ -581,7 +573,7 @@ func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) e
 
 // importToken stores a token record read from in for the named local account, after Anthropic
 // accepts it. The account must already exist here, so the proxy knows it.
-func importToken(a *accounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
+func importToken(a *claudeAccounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: limitbreak import-token <name> < record.json")
 	}
@@ -597,7 +589,7 @@ func importToken(a *accounts, args []string, validate tokenValidator, in io.Read
 		return fmt.Errorf("the token has expired")
 	}
 	var target *account
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		if acc.ID == args[0] {
 			acc := acc
 			target = &acc

@@ -26,7 +26,7 @@ func signIn(t *testing.T, email string) func(dir string) error {
 
 func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "account-1": "t-one"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	var out bytes.Buffer
 	if err := addAccount(a, "", signIn(t, "new@example.com"), &out); err != nil {
 		t.Fatal(err)
@@ -34,7 +34,7 @@ func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 	if !strings.Contains(out.String(), "Added account-2 (new@example.com). 3 accounts now.") {
 		t.Fatal(out.String())
 	}
-	if len(freshAccounts(a)) != 3 {
+	if len(a.list()) != 3 {
 		t.Fatal("the new login is not discovered")
 	}
 }
@@ -42,7 +42,7 @@ func TestAddNamesTheNextFreeAccountAndReportsWhoSignedIn(t *testing.T) {
 func TestAddWarnsWhenTheSameLoginIsAddedTwice(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default"})
 	var out bytes.Buffer
-	if err := addAccount(newAccounts(home, credentialsFile, ""), "again", signIn(t, "default@example.com"), &out); err != nil {
+	if err := addAccount(newClaudeAccounts(home, credentialsFile, ""), "again", signIn(t, "default@example.com"), &out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "same login") {
@@ -52,7 +52,7 @@ func TestAddWarnsWhenTheSameLoginIsAddedTwice(t *testing.T) {
 
 func TestAddRefusesBadNamesAndCleansUpAFailedSignIn(t *testing.T) {
 	home := t.TempDir()
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	for _, name := range []string{"default", "../x", "a b"} {
 		if err := addAccount(a, name, signIn(t, "x@example.com"), &bytes.Buffer{}); err == nil {
 			t.Fatalf("%q accepted", name)
@@ -73,12 +73,12 @@ func TestAddRefusesBadNamesAndCleansUpAFailedSignIn(t *testing.T) {
 
 func TestRemoveDeletesTheLoginAfterConfirmationAndNeverTheDefault(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	var out bytes.Buffer
 	if err := removeAccount(a, []string{"work"}, strings.NewReader("n\n"), &out); err != nil {
 		t.Fatal(err)
 	}
-	if len(freshAccounts(a)) != 2 {
+	if len(a.list()) != 2 {
 		t.Fatal("removed without confirmation")
 	}
 	if err := removeAccount(a, []string{"default", "-y"}, strings.NewReader(""), &out); err == nil {
@@ -87,7 +87,7 @@ func TestRemoveDeletesTheLoginAfterConfirmationAndNeverTheDefault(t *testing.T) 
 	if err := removeAccount(a, []string{"work"}, strings.NewReader("y\n"), &out); err != nil {
 		t.Fatal(err)
 	}
-	if list := freshAccounts(a); len(list) != 1 || list[0].ID != "default" {
+	if list := a.list(); len(list) != 1 || list[0].ID != "default" {
 		t.Fatal(list)
 	}
 }
@@ -118,7 +118,7 @@ func (f *fakeSetupToken) run(acc account, typescript string) error {
 
 func TestRenewSkipsFreshTokensUnlessAllAndNeverStoresARejectedOne(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work", "spare": "t-spare"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	if err := a.writeLongToken(accountNamed(t, a, "default"), newLongToken("sk-ant-oat01-fresh", time.Now())); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestRenewSkipsFreshTokensUnlessAllAndNeverStoresARejectedOne(t *testing.T) 
 
 func TestRemoveAlsoDeletesTheLongToken(t *testing.T) {
 	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	work := accountNamed(t, a, "work")
 	a.writeLongToken(work, newLongToken("sk-ant-oat01-x", time.Now()))
 	if err := removeAccount(a, []string{"work", "-y"}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
@@ -230,8 +230,8 @@ func TestWithLoginHint(t *testing.T) {
 }
 
 func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
-	src := newAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
-	dst := newAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
+	src := newClaudeAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
+	dst := newClaudeAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
 	now := time.Now()
 	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
 	src.writeLongToken(accountNamed(t, src, "spare"), newLongToken("sk-ant-oat01-spare", now))
@@ -272,11 +272,11 @@ func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
 
 func TestKeychainModeAlsoReadsTheTokenFile(t *testing.T) {
 	home := makeHome(t, map[string]string{"work": "y"})
-	file := newAccounts(home, credentialsFile, "")
+	file := newClaudeAccounts(home, credentialsFile, "")
 	acc := accountNamed(t, file, "work")
 	acc.ID = "limitbreak-test-absent-" + strings.ReplaceAll(t.Name(), "/", "-") // never in the real Keychain
 	file.writeLongToken(acc, newLongToken("sk-ant-oat01-file", time.Now()))
-	kc := newAccounts(home, credentialsKeychain, "")
+	kc := newClaudeAccounts(home, credentialsKeychain, "")
 	if got, ok := kc.readLongToken(acc); !ok || got.Token != "sk-ant-oat01-file" {
 		t.Fatal(got, ok)
 	}

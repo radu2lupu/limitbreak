@@ -123,7 +123,7 @@ func authWarning(id string, end time.Time, kind authKind) string {
 func longTokenPath(acc account) string { return filepath.Join(acc.Path, longTokenFile) }
 
 // readLongToken is the account's stored long-lived token, expired or not; false when none.
-func (a *accounts) readLongToken(acc account) (longToken, bool) {
+func (a *claudeAccounts) readLongToken(acc account) (longToken, bool) {
 	var sources [][]byte
 	if a.credentials == credentialsKeychain {
 		if out, err := exec.Command("security", "find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w").Output(); err == nil {
@@ -145,7 +145,7 @@ func (a *accounts) readLongToken(acc account) (longToken, bool) {
 	return best, best.Token != ""
 }
 
-func (a *accounts) writeLongToken(acc account, t longToken) error {
+func (a *claudeAccounts) writeLongToken(acc account, t longToken) error {
 	raw, err := json.Marshal(t)
 	if err != nil {
 		return err
@@ -178,7 +178,7 @@ func (a *accounts) writeLongToken(acc account, t longToken) error {
 }
 
 // deleteLongToken removes the account's long-lived token; none stored is not an error.
-func (a *accounts) deleteLongToken(acc account) error {
+func (a *claudeAccounts) deleteLongToken(acc account) error {
 	if a.credentials == credentialsKeychain {
 		// Exit status 44 is "not found"; any other failure leaves nothing we can do from here.
 		_ = exec.Command("security", "delete-generic-password", "-a", acc.ID, "-s", longTokenService).Run()
@@ -190,12 +190,12 @@ func (a *accounts) deleteLongToken(acc account) error {
 }
 
 // authInfo is the account's auth end and kind, read now.
-func (a *accounts) authInfo(acc account) (time.Time, authKind) {
+func (a *claudeAccounts) authInfo(acc account) (time.Time, authKind) {
 	return a.authInfoFrom(acc, a.credentialSources(acc.Dir, acc.Path))
 }
 
 // authInfoFrom is authInfo for credential sources already read.
-func (a *accounts) authInfoFrom(acc account, sources [][]byte) (time.Time, authKind) {
+func (a *claudeAccounts) authInfoFrom(acc account, sources [][]byte) (time.Time, authKind) {
 	var long *longToken
 	if t, ok := a.readLongToken(acc); ok {
 		long = &t
@@ -208,12 +208,12 @@ func (a *accounts) authInfoFrom(acc account, sources [][]byte) (time.Time, authK
 // authWatch warns, from the running proxy, about accounts whose auth ends within warnWithin: a log
 // line and a desktop notification, at most once per account per warnEvery.
 type authWatch struct {
-	accounts *accounts
+	accounts *claudeAccounts
 	notify   func(message string)
 	warned   map[string]time.Time
 }
 
-func newAuthWatch(a *accounts, notify func(string)) *authWatch {
+func newAuthWatch(a *claudeAccounts, notify func(string)) *authWatch {
 	return &authWatch{accounts: a, notify: notify, warned: map[string]time.Time{}}
 }
 

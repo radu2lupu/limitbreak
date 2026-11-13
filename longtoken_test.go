@@ -9,9 +9,9 @@ import (
 	"time"
 )
 
-func accountNamed(t *testing.T, a *accounts, id string) account {
+func accountNamed(t *testing.T, a *claudeAccounts, id string) account {
 	t.Helper()
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		if acc.ID == id {
 			return acc
 		}
@@ -21,7 +21,7 @@ func accountNamed(t *testing.T, a *accounts, id string) account {
 }
 
 func TestLongTokenRoundTripsThroughAPrivateFile(t *testing.T) {
-	a := newAccounts(makeHome(t, map[string]string{"work": "t-work"}), credentialsFile, "")
+	a := newClaudeAccounts(makeHome(t, map[string]string{"work": "t-work"}), credentialsFile, "")
 	acc := accountNamed(t, a, "work")
 	if _, ok := a.readLongToken(acc); ok {
 		t.Fatal("token before any was written")
@@ -53,7 +53,7 @@ func TestLongTokenRoundTripsThroughAPrivateFile(t *testing.T) {
 }
 
 func TestReadTokenPrefersAnUnexpiredLongTokenAndIgnoresAnExpiredOne(t *testing.T) {
-	a := newAccounts(makeHome(t, map[string]string{"work": "t-work"}), credentialsFile, "")
+	a := newClaudeAccounts(makeHome(t, map[string]string{"work": "t-work"}), credentialsFile, "")
 	acc := accountNamed(t, a, "work")
 	now := time.Now()
 	a.writeLongToken(acc, newLongToken("sk-ant-oat01-long", now))
@@ -157,7 +157,7 @@ func TestAuthWatchWarnsAboutAnEndingSignInOncePerDay(t *testing.T) {
 		"accessToken": "t-work", "expiresAt": float64(far) * 1000, "refreshTokenExpiresAt": now.Add(3 * 24 * time.Hour).UnixMilli()}})
 	writeJSON(t, filepath.Join(home, ".claude-fine", ".credentials.json"), map[string]any{"claudeAiOauth": map[string]any{
 		"accessToken": "t-fine", "expiresAt": float64(far) * 1000, "refreshTokenExpiresAt": now.Add(20 * 24 * time.Hour).UnixMilli()}})
-	a := newAccounts(home, credentialsFile, "")
+	a := newClaudeAccounts(home, credentialsFile, "")
 	a.now = func() time.Time { return now }
 	var sent []string
 	w := newAuthWatch(a, func(m string) { sent = append(sent, m) })
