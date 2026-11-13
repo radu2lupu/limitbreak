@@ -186,8 +186,29 @@ func (a *codexAccounts) loginCommand(dir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// forget deletes a Codex login: its home dir, which holds its auth.json.
-func (a *codexAccounts) forget(acc account) error { return os.RemoveAll(acc.Dir) }
+// forget deletes a Codex login. A home dir Limit Break made goes whole; one it found (a
+// ~/.codex-<name> another tool also keeps logs or sessions in) loses only its auth.json.
+func (a *codexAccounts) forget(acc account) error {
+	if _, err := os.Stat(filepath.Join(acc.Dir, createdMarker)); err == nil {
+		return os.RemoveAll(acc.Dir)
+	}
+	if err := os.Remove(filepath.Join(acc.Dir, "auth.json")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// createdMarker marks a login dir Limit Break made itself, so remove may delete all of it.
+const createdMarker = ".limitbreak-created"
+
+func isAccount(list []account, id string) bool {
+	for _, acc := range list {
+		if acc.ID == id {
+			return true
+		}
+	}
+	return false
+}
 
 // MARK: Add and remove
 
@@ -230,8 +251,18 @@ func prepareAdd(a loginProvider, name string) (string, string, bool, error) {
 	dir := a.dirFor(name)
 	_, statErr := os.Stat(dir)
 	created := os.IsNotExist(statErr)
+	if !created && !isAccount(a.list(), name) {
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+			// Another tool's dir with the same name (say ~/.codex-chief): never sign into it,
+			// or a later remove would delete what it keeps there.
+			return "", "", false, fmt.Errorf("%s already exists and is not a login here; pick another name", dir)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", false, err
+	}
+	if created {
+		_ = os.WriteFile(filepath.Join(dir, createdMarker), nil, 0o600)
 	}
 	return name, dir, created, nil
 }
@@ -241,7 +272,7 @@ func prepareAdd(a loginProvider, name string) (string, string, bool, error) {
 func finishAdd(a loginProvider, name, dir string, created bool, loginErr error) (account, []account, []account, error) {
 	if loginErr != nil {
 		if created {
-			_ = os.Remove(dir)
+			_ = os.RemoveAll(dir)
 		}
 		return account{}, nil, nil, fmt.Errorf("sign-in failed: %w", loginErr)
 	}
@@ -254,7 +285,7 @@ func finishAdd(a loginProvider, name, dir string, created bool, loginErr error) 
 	}
 	if added == nil {
 		if created {
-			_ = os.Remove(dir)
+			_ = os.RemoveAll(dir)
 		}
 		return account{}, nil, nil, fmt.Errorf("no login found after sign-in; nothing was added")
 	}

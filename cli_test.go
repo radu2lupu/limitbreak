@@ -420,7 +420,7 @@ func TestRemoveJSONNeedsYesAndReportsTheRemoval(t *testing.T) {
 	if strings.TrimSpace(out.String()) != `{"event":"removed","provider":"codex","id":"work","email":"work@example.com"}` {
 		t.Fatal(out.String())
 	}
-	if _, err := os.Stat(filepath.Join(home, ".codex-work")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(home, ".codex-work", "auth.json")); !os.IsNotExist(err) {
 		t.Fatal("login left behind")
 	}
 	if _, err := os.Stat(filepath.Join(home, ".codex", "auth.json")); err != nil {
@@ -442,5 +442,54 @@ func TestAccountFlags(t *testing.T) {
 	}
 	if _, _, _, err = accountFlags([]string{"--provider"}); err == nil {
 		t.Fatal("a missing provider accepted")
+	}
+}
+
+func TestAddRefusesAnotherToolsDirAndCodexRemoveKeepsWhatItDidNotMake(t *testing.T) {
+	home := t.TempDir()
+	chief := filepath.Join(home, ".codex-chief")
+	if err := os.MkdirAll(chief, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(chief, "chief.sqlite"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &codexAccounts{home: home}
+	if _, _, _, err := prepareAdd(a, "chief"); err == nil {
+		t.Fatal("add signed into another tool's dir")
+	}
+	if _, err := os.Stat(filepath.Join(chief, "chief.sqlite")); err != nil {
+		t.Fatal("refused add touched the dir")
+	}
+
+	// A login dir that was already there before Limit Break (like ~/.codex-planner): remove
+	// deletes its auth.json and keeps everything else.
+	planner := filepath.Join(home, ".codex-planner")
+	if err := os.MkdirAll(filepath.Join(planner, "log"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planner, "auth.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.forget(account{ID: "planner", Dir: planner}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(planner, "auth.json")); !os.IsNotExist(err) {
+		t.Fatal("auth.json survived remove")
+	}
+	if _, err := os.Stat(filepath.Join(planner, "log")); err != nil {
+		t.Fatal("remove deleted a dir Limit Break did not make")
+	}
+
+	// A dir Limit Break made goes whole.
+	_, made, created, err := prepareAdd(a, "fresh")
+	if err != nil || !created {
+		t.Fatalf("prepareAdd fresh: created=%v err=%v", created, err)
+	}
+	if err := a.forget(account{ID: "fresh", Dir: made}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(made); !os.IsNotExist(err) {
+		t.Fatal("a dir Limit Break made survived remove")
 	}
 }
