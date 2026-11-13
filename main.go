@@ -23,6 +23,9 @@
 // forwarded untouched with Claude Code's own credentials. `GET /_status` lists the accounts (who they
 // are, spent-until, auth end, last usage, active-for clients); `PUT /_c/<client>/_active` with
 // `{"id":"<account>"}` sets a client's active account.
+//
+// Codex accounts (ChatGPT sign-ins, codex.go) work the same way under `/backend-api/codex/…`. Each
+// kind of account is a provider (pool.go); the active account is per client per provider.
 package main
 
 import (
@@ -135,6 +138,11 @@ type account struct {
 	// AuthEnds is when the account stops being usable without the user (see authEnd); zero when
 	// no source states it. Read at discovery, so `GET /_status` does not ask the Keychain.
 	AuthEnds time.Time `json:"-"`
+	// Plan is the subscription the login is on ("max", "plus"); empty when unknown.
+	Plan string `json:"-"`
+	// Who identifies the subscription behind the login: two accounts with the same Who add no
+	// capacity. Claude: the email. Codex: the ChatGPT user and workspace.
+	Who string `json:"-"`
 }
 
 // claudeAccounts is the Claude provider: the logins Claude Code holds on this host.
@@ -191,7 +199,9 @@ func (a *claudeAccounts) list() []account {
 	}
 	for i := range found {
 		found[i].Email = a.email(found[i])
+		found[i].Who = found[i].Email
 		found[i].AuthEnds, _ = a.authInfoFrom(found[i], sources[i])
+		found[i].Plan = subscription(sources[i])
 	}
 	return found
 }
@@ -285,6 +295,8 @@ type login struct {
 	ExpiresAt   *float64 `json:"expiresAt"`
 	// RefreshTokenExpiresAt is the sign-in's hard end (epoch ms); refreshing does not move it.
 	RefreshTokenExpiresAt *float64 `json:"refreshTokenExpiresAt"`
+	// SubscriptionType is the plan the sign-in is on ("pro", "max", "team").
+	SubscriptionType string `json:"subscriptionType"`
 }
 
 // parseLogin reads a credential document: Claude Code's `{"claudeAiOauth": {...}}` or a bare login.
@@ -300,6 +312,16 @@ func parseLogin(raw []byte) (login, bool) {
 		return *doc.ClaudeAiOauth, true
 	}
 	return doc.login, true
+}
+
+// subscription is the plan the first credential source that states one is on; empty when none does.
+func subscription(sources [][]byte) string {
+	for _, raw := range sources {
+		if l, ok := parseLogin(raw); ok && l.SubscriptionType != "" {
+			return l.SubscriptionType
+		}
+	}
+	return ""
 }
 
 // claudeEnv is the environment for running `claude` as the login in configDir (empty: the default
@@ -364,12 +386,14 @@ func (a *claudeAccounts) unauthorized(acc account) (retry, handBack bool) {
 	return false, false
 }
 
-func (a *claudeAccounts) usage(acc account) map[string]usageValue {
+// usage is the stored usage headers and the windows they describe.
+func (a *claudeAccounts) usage(acc account) (map[string]usageValue, []usageWindow) {
 	records, err := readUsage(a.home)
 	if err != nil {
 		log.Printf("usage record read: %v", err)
 	}
-	return usageFor(records, acc)
+	values := usageFor(records, acc)
+	return values, claudeWindows(values)
 }
 
 // MARK: Proxy
@@ -422,6 +446,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if path == activePath && clientName != sharedClient {
 		p.serveActive(w, r, clientName)
+		return
+	}
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		// Requests are put on accounts one by one, which a socket cannot be; Codex falls back to
+		// HTTP with streamed events when told so.
+		apiError(w, http.StatusUpgradeRequired, "websocket is not supported here; use HTTP")
 		return
 	}
 	pl := p.poolFor(path)
@@ -506,8 +536,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.passThrough(w, r, pl.upstream+path, body)
 }
 
-// serveActive answers `PUT /_c/<client>/_active` with `{"id":"<account id>"}`: the client's active
-// account becomes that one (it still moves on when that account is spent). 404 for an unknown id.
+// serveActive answers `PUT /_c/<client>/_active` with `{"provider":"codex","id":"<account id>"}`
+// (provider defaults to the first pool's, "claude"): the client's active account for that provider
+// becomes that one (it still moves on when that account is spent). 404 for an unknown provider or id.
 func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client string) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", http.MethodPut)
@@ -515,13 +546,27 @@ func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client strin
 		return
 	}
 	var body struct {
-		ID string `json:"id"`
+		Provider string `json:"provider"`
+		ID       string `json:"id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.ID == "" {
-		apiError(w, http.StatusBadRequest, `body must be {"id":"<account id>"}`)
+		apiError(w, http.StatusBadRequest, `body must be {"provider":"<claude|codex>","id":"<account id>"}`)
 		return
 	}
-	if !p.pools[0].setActive(client, body.ID) {
+	if body.Provider == "" {
+		body.Provider = p.pools[0].provider.name()
+	}
+	var pl *pool
+	for _, candidate := range p.pools {
+		if candidate.provider.name() == body.Provider {
+			pl = candidate
+		}
+	}
+	if pl == nil {
+		apiError(w, http.StatusNotFound, "no provider "+body.Provider)
+		return
+	}
+	if !pl.setActive(client, body.ID) {
 		apiError(w, http.StatusNotFound, "no account "+body.ID)
 		return
 	}
@@ -616,8 +661,9 @@ func serve(args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := flags.Int("port", envInt("LIMITBREAK_PORT", defaultPort), "port to listen on (loopback only)")
 	upstream := flags.String("upstream", envString("LIMITBREAK_UPSTREAM", defaultUpstream), "Anthropic API address")
+	codexUpstream := flags.String("codex-upstream", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream), "ChatGPT backend address for Codex")
 	home, _ := os.UserHomeDir()
-	homeFlag := flags.String("home", home, "home dir holding the Claude logins")
+	homeFlag := flags.String("home", home, "home dir holding the Claude and Codex logins")
 	credentials := flags.String("credentials", "auto", "auto, keychain or file")
 	_ = flags.Parse(args)
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
@@ -627,7 +673,8 @@ func serve(args []string) {
 	log.Printf("limitbreak listening on http://%s", listener.Addr())
 	a := newClaudeAccounts(*homeFlag, *credentials, "")
 	go newAuthWatch(a, notifyDesktop).run()
-	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream))))
+	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
+	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream))))
 }
 
 func envString(name, fallback string) string {

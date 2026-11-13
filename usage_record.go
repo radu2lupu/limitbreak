@@ -141,3 +141,75 @@ func showUsage(out io.Writer, home string, acc account) {
 		fmt.Fprintf(out, "    %s: %s (observed %s)\n", name, value, item.Observed.Local().Format(time.RFC1123))
 	}
 }
+
+// MARK: Windows
+
+// usageWindow is one usage window of an account, the same shape for every provider: how much of
+// it is used, when it resets, how long it is, and when that was seen (unix seconds).
+type usageWindow struct {
+	ID            string  `json:"id"`
+	Label         string  `json:"label"`
+	UsedPercent   float64 `json:"usedPercent"`
+	ResetsAt      *int64  `json:"resetsAt"`
+	WindowMinutes int     `json:"windowMinutes"`
+	Observed      int64   `json:"observed"`
+}
+
+func newWindow(id string, usedPercent float64, resetsAt int64, minutes int, observed time.Time) usageWindow {
+	w := usageWindow{ID: id, Label: windowLabel(minutes), UsedPercent: usedPercent, WindowMinutes: minutes, Observed: observed.Unix()}
+	if resetsAt > 0 {
+		w.ResetsAt = &resetsAt
+	}
+	return w
+}
+
+// windowLabel is the one rule for naming a window by its length: "weekly" for seven days, else
+// "<n>d", "<n>h" or "<n>m"; empty when the length is unknown.
+func windowLabel(minutes int) string {
+	switch {
+	case minutes <= 0:
+		return ""
+	case minutes == 7*24*60:
+		return "weekly"
+	case minutes%(24*60) == 0:
+		return fmt.Sprintf("%dd", minutes/(24*60))
+	case minutes%60 == 0:
+		return fmt.Sprintf("%dh", minutes/60)
+	}
+	return fmt.Sprintf("%dm", minutes)
+}
+
+// claudeWindows are the 5-hour and 7-day windows in a Claude account's stored usage headers; a
+// window is left out when its utilization was never seen.
+func claudeWindows(values map[string]usageValue) []usageWindow {
+	var out []usageWindow
+	for _, w := range []struct {
+		id, used, reset string
+		minutes         int
+	}{
+		{"five_hour", "five_hour_utilization", "five_hour_reset", 5 * 60},
+		{"seven_day", "seven_day_utilization", "seven_day_reset", 7 * 24 * 60},
+	} {
+		used, ok := values[w.used]
+		if !ok {
+			continue
+		}
+		out = append(out, newWindow(w.id, used.Value*100, int64(values[w.reset].Value), w.minutes, used.Observed))
+	}
+	return out
+}
+
+// showWindows prints usage windows for `limitbreak list`.
+func showWindows(out io.Writer, windows []usageWindow) {
+	for _, w := range windows {
+		label := w.Label
+		if label == "" {
+			label = w.ID
+		}
+		line := fmt.Sprintf("    %s: %.0f%% used", label, w.UsedPercent)
+		if w.ResetsAt != nil {
+			line += ", resets " + time.Unix(*w.ResetsAt, 0).Local().Format(time.RFC1123)
+		}
+		fmt.Fprintf(out, "%s (observed %s)\n", line, time.Unix(w.Observed, 0).Local().Format(time.RFC1123))
+	}
+}

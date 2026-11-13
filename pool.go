@@ -1,6 +1,6 @@
 package main
 
-// A provider is one kind of account (Claude; more later): where its logins live, how a request is
+// A provider is one kind of account (Claude, Codex; more later): where its logins live, how a request is
 // put on one, how a reply says the account is spent, and what its usage is. A pool is one
 // provider's accounts as the proxy rotates them: which one each client is on, and which are spent
 // until when. What differs between providers is behind the interface; the rotation is the pool's.
@@ -15,7 +15,7 @@ import (
 )
 
 type provider interface {
-	// name is the provider's id in the API ("claude").
+	// name is the provider's id in the API ("claude", "codex").
 	name() string
 	// list is every account with a login, read now, the default one first.
 	list() []account
@@ -36,8 +36,9 @@ type provider interface {
 	// renewed), or hand the 401 back to the client (it was the client's own login). Otherwise
 	// the account is skipped for a while.
 	unauthorized(acc account) (retry, handBack bool)
-	// usage is the account's stored usage values by name; nil when there are none.
-	usage(acc account) map[string]usageValue
+	// usage is the account's raw usage values by name (nil when the provider keeps none) and its
+	// windows, normalised.
+	usage(acc account) (map[string]usageValue, []usageWindow)
 }
 
 type pool struct {
@@ -132,14 +133,22 @@ func (p *pool) setActive(client, id string) bool {
 }
 
 type accountStatus struct {
-	ID         string   `json:"id"`
-	Email      string   `json:"email,omitempty"`
+	ID string `json:"id"`
+	// Provider is the kind of account: "claude" or "codex". Absent means "claude".
+	Provider string `json:"provider"`
+	Email    string `json:"email,omitempty"`
+	// Label is the name to show for the account: its email when known, else its id.
+	Label string `json:"label"`
+	// Plan is the subscription ("max", "plus"); empty when unknown.
+	Plan       string   `json:"plan"`
 	SpentUntil *int64   `json:"spentUntil"`
 	ActiveFor  []string `json:"activeFor"`
 	// AuthEnds is when the account's auth ends (unix seconds); null when unknown.
 	AuthEnds *int64 `json:"authEnds"`
 	// Usage is the latest usage headers seen for the account (see usage_record.go), by name.
 	Usage map[string]usageValue `json:"usage,omitempty"`
+	// Windows are the account's usage windows, the same shape for every provider.
+	Windows []usageWindow `json:"windows"`
 }
 
 func (p *pool) status() []accountStatus {
@@ -148,7 +157,8 @@ func (p *pool) status() []accountStatus {
 	now := p.now()
 	out := []accountStatus{}
 	for _, acc := range list {
-		s := accountStatus{ID: acc.ID, Email: acc.Email, ActiveFor: []string{}}
+		s := accountStatus{ID: acc.ID, Provider: p.provider.name(), Email: acc.Email, Label: accountLabel(acc), Plan: acc.Plan,
+			ActiveFor: []string{}, Windows: []usageWindow{}}
 		if until := p.spentUntil[acc.ID]; until.After(now) {
 			unix := until.Unix()
 			s.SpentUntil = &unix
@@ -168,7 +178,19 @@ func (p *pool) status() []accountStatus {
 	p.mu.Unlock()
 	// Usage may be read from disk (or, for some providers, asked for), so not under the lock.
 	for i, acc := range list {
-		out[i].Usage = p.provider.usage(acc)
+		values, windows := p.provider.usage(acc)
+		out[i].Usage = values
+		if windows != nil {
+			out[i].Windows = windows
+		}
 	}
 	return out
+}
+
+// accountLabel is the one rule for naming an account to a person: its email, else its id.
+func accountLabel(acc account) string {
+	if acc.Email != "" {
+		return acc.Email
+	}
+	return acc.ID
 }
