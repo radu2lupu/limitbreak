@@ -191,11 +191,16 @@ func (a *accounts) deleteLongToken(acc account) error {
 
 // authInfo is the account's auth end and kind, read now.
 func (a *accounts) authInfo(acc account) (time.Time, authKind) {
+	return a.authInfoFrom(acc, a.credentialSources(acc.Dir, acc.Path))
+}
+
+// authInfoFrom is authInfo for credential sources already read.
+func (a *accounts) authInfoFrom(acc account, sources [][]byte) (time.Time, authKind) {
 	var long *longToken
 	if t, ok := a.readLongToken(acc); ok {
 		long = &t
 	}
-	return authEnd(long, a.credentialSources(acc.Dir, acc.Path), a.now())
+	return authEnd(long, sources, a.now())
 }
 
 // MARK: Watch

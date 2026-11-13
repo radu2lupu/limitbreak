@@ -95,6 +95,11 @@ To use the same tokens on another machine of yours, sign the same-named accounts
 
 A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding.
 
+Loopback API for apps that show accounts (JSON; fields are only ever added):
+
+- `GET /_status`: every account with `id`, `email`, `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null) and `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). No token is ever in it.
+- `PUT /_c/<client>/_active` with `{"id":"work"}`: that client's next request goes to `work` (it still moves on when `work` is spent). `404` for an unknown id. Replies with the status list.
+
 ## Caveats, read these
 
 - **Terms of service.** This uses the official `claude` binary with accounts you own, but spreading load across subscription accounts may conflict with Anthropic's terms for your plan. Read them; you are responsible for your use. Not affiliated with or endorsed by Anthropic.

@@ -110,23 +110,30 @@ func (a *accounts) recordUsage(acc account, h http.Header) {
 	}
 }
 
+// usageFor is the account's recorded usage values; nil when there are none, or when they were
+// recorded for another login under the same id.
+func usageFor(records map[string]usageRecord, acc account) map[string]usageValue {
+	record, ok := records[acc.ID]
+	if !ok || record.Email != acc.Email || len(record.Values) == 0 {
+		return nil
+	}
+	return record.Values
+}
+
 func showUsage(out io.Writer, home string, acc account) {
 	records, err := readUsage(home)
 	if err != nil {
 		fmt.Fprintf(out, "    usage record unavailable: %v\n", err)
 		return
 	}
-	record, ok := records[acc.ID]
-	if !ok || record.Email != acc.Email {
-		return
-	}
-	names := make([]string, 0, len(record.Values))
-	for name := range record.Values {
+	values := usageFor(records, acc)
+	names := make([]string, 0, len(values))
+	for name := range values {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		item := record.Values[name]
+		item := values[name]
 		value := fmt.Sprintf("%.1f%% used", item.Value*100)
 		if name == "five_hour_reset" || name == "seven_day_reset" {
 			value = time.Unix(int64(item.Value), 0).Local().Format(time.RFC1123)
