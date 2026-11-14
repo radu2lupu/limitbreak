@@ -20,7 +20,9 @@
 //
 // A path may start with a client name (`/_c/<client>/v1/messages`); each client has its own active
 // account. Any other path is the shared client's. Requests that are not the messages API are
-// forwarded untouched with Claude Code's own credentials. `GET /_status` lists the accounts.
+// forwarded untouched with Claude Code's own credentials. `GET /_status` lists the accounts (who they
+// are, spent-until, auth end, last usage, active-for clients); `PUT /_c/<client>/_active` with
+// `{"id":"<account>"}` sets a client's active account.
 package main
 
 import (
@@ -53,6 +55,7 @@ const (
 	defaultPort         = 48617
 	defaultUpstream     = "https://api.anthropic.com"
 	sharedClient        = "shared"
+	activePath          = "/_active"
 	fallbackExhaustion  = time.Hour
 	unavailableBackoff  = 5 * time.Minute
 	discoveryInterval   = 30 * time.Second
@@ -134,6 +137,9 @@ type account struct {
 	// Dir is the config dir of a non-default login; empty for the default one.
 	Dir  string `json:"-"`
 	Path string `json:"-"`
+	// AuthEnds is when the account stops being usable without the user (see authEnd); zero when
+	// no source states it. Read at discovery, so `GET /_status` does not ask the Keychain.
+	AuthEnds time.Time `json:"-"`
 }
 
 type accounts struct {
@@ -173,9 +179,11 @@ func (a *accounts) list() []account {
 	a.mu.Unlock()
 
 	var found []account
+	var sources [][][]byte
 	defaultDir := filepath.Join(a.home, ".claude")
-	if len(a.credentialSources("", defaultDir)) > 0 {
+	if s := a.credentialSources("", defaultDir); len(s) > 0 {
 		found = append(found, account{ID: defaultID, Path: defaultDir})
+		sources = append(sources, s)
 	}
 	entries, _ := os.ReadDir(a.home)
 	names := make([]string, 0, len(entries))
@@ -191,12 +199,14 @@ func (a *accounts) list() []account {
 		if info, err := os.Stat(path); err != nil || !info.IsDir() {
 			continue
 		}
-		if len(a.credentialSources(path, path)) > 0 {
+		if s := a.credentialSources(path, path); len(s) > 0 {
 			found = append(found, account{ID: strings.TrimPrefix(name, ".claude-"), Dir: path, Path: path})
+			sources = append(sources, s)
 		}
 	}
 	for i := range found {
 		found[i].Email = a.email(found[i])
+		found[i].AuthEnds, _ = a.authInfoFrom(found[i], sources[i])
 	}
 	a.mu.Lock()
 	a.discovered, a.discoveredAt = found, a.now()
@@ -386,12 +396,20 @@ type accountStatus struct {
 	Email      string   `json:"email,omitempty"`
 	SpentUntil *int64   `json:"spentUntil"`
 	ActiveFor  []string `json:"activeFor"`
+	// AuthEnds is when the account's auth ends (unix seconds); null when unknown.
+	AuthEnds *int64 `json:"authEnds"`
+	// Usage is the latest usage headers seen for the account (see usage_record.go), by name.
+	Usage map[string]usageValue `json:"usage,omitempty"`
 }
 
 func (a *accounts) status() []accountStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := a.now()
+	records, err := readUsage(a.home)
+	if err != nil {
+		log.Printf("usage record read: %v", err)
+	}
 	out := []accountStatus{}
 	for _, acc := range a.discovered {
 		s := accountStatus{ID: acc.ID, Email: acc.Email, ActiveFor: []string{}}
@@ -399,6 +417,11 @@ func (a *accounts) status() []accountStatus {
 			unix := until.Unix()
 			s.SpentUntil = &unix
 		}
+		if !acc.AuthEnds.IsZero() {
+			unix := acc.AuthEnds.Unix()
+			s.AuthEnds = &unix
+		}
+		s.Usage = usageFor(records, acc)
 		for client, id := range a.active {
 			if id == acc.ID {
 				s.ActiveFor = append(s.ActiveFor, client)
@@ -408,6 +431,20 @@ func (a *accounts) status() []accountStatus {
 		out = append(out, s)
 	}
 	return out
+}
+
+// setActive makes id the client's active account; false when no account has that id.
+func (a *accounts) setActive(client, id string) bool {
+	for _, acc := range a.list() {
+		if acc.ID == id {
+			a.mu.Lock()
+			a.active[client] = id
+			a.mu.Unlock()
+			log.Printf("client %s set to account %s", client, id)
+			return true
+		}
+	}
+	return false
 }
 
 // MARK: Proxy
@@ -439,6 +476,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientName, path, ok := route(r.URL.RequestURI())
 	if !ok {
 		apiError(w, http.StatusNotFound, "unknown path")
+		return
+	}
+	if path == activePath && clientName != sharedClient {
+		p.serveActive(w, r, clientName)
 		return
 	}
 	body, err := io.ReadAll(r.Body)
@@ -507,6 +548,29 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.passThrough(w, r, path, body)
+}
+
+// serveActive answers `PUT /_c/<client>/_active` with `{"id":"<account id>"}`: the client's active
+// account becomes that one (it still moves on when that account is spent). 404 for an unknown id.
+func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client string) {
+	if r.Method != http.MethodPut {
+		w.Header().Set("Allow", http.MethodPut)
+		apiError(w, http.StatusMethodNotAllowed, "use PUT")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.ID == "" {
+		apiError(w, http.StatusBadRequest, `body must be {"id":"<account id>"}`)
+		return
+	}
+	if !p.accounts.setActive(client, body.ID) {
+		apiError(w, http.StatusNotFound, "no account "+body.ID)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(p.accounts.status())
 }
 
 // A proxy that cannot place a request on an account sends it on as Claude Code made it: it is

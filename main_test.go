@@ -285,3 +285,105 @@ func TestEveryTokenRejectedFallsBackToClaudesOwnLogin(t *testing.T) {
 		t.Fatal(up.seen)
 	}
 }
+
+func put(t *testing.T, url, body string) (int, string) {
+	t.Helper()
+	req, _ := http.NewRequest("PUT", url, strings.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(raw)
+}
+
+func getStatus(t *testing.T, base string) []accountStatus {
+	t.Helper()
+	resp, err := http.Get(base + "/_status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var rows []accountStatus
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
+
+func TestPutActiveSetsTheClientsAccountAndTheNextRequestUsesIt(t *testing.T) {
+	up := newUpstream(t)
+	server, acc := start(t, makeHome(t, map[string]string{"default": "t-default", "work": "t-work"}), up)
+	if status, body := put(t, server.URL+"/_c/agent_a/_active", `{"id":"work"}`); status != 200 || !strings.Contains(body, `"activeFor":["agent_a"]`) {
+		t.Fatal(status, body)
+	}
+	if acc.active["agent_a"] != "work" {
+		t.Fatal(acc.active)
+	}
+	post(t, server.URL, "/_c/agent_a/v1/messages")
+	post(t, server.URL, "/_c/agent_b/v1/messages")
+	if strings.Join(up.seen, ",") != "Bearer t-work,Bearer t-default" {
+		t.Fatal(up.seen)
+	}
+	for _, row := range getStatus(t, server.URL) {
+		want := map[string]string{"default": "agent_b", "work": "agent_a"}[row.ID]
+		if strings.Join(row.ActiveFor, ",") != want {
+			t.Fatal(row.ID, row.ActiveFor)
+		}
+	}
+}
+
+func TestPutActiveRejectsAnUnknownAccountAndABadBody(t *testing.T) {
+	up := newUpstream(t)
+	server, acc := start(t, makeHome(t, map[string]string{"default": "t-default"}), up)
+	if status, _ := put(t, server.URL+"/_c/agent_a/_active", `{"id":"nobody"}`); status != 404 {
+		t.Fatal(status)
+	}
+	if status, _ := put(t, server.URL+"/_c/agent_a/_active", `not json`); status != 400 {
+		t.Fatal(status)
+	}
+	if status, _ := post(t, server.URL, "/_c/agent_a/_active"); status != 405 {
+		t.Fatal(status)
+	}
+	if _, ok := acc.active["agent_a"]; ok || len(up.seen) != 0 {
+		t.Fatal(acc.active, up.seen)
+	}
+}
+
+func TestStatusCarriesUsageAndAuthEndWithoutTokens(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work"})
+	writeJSON(t, filepath.Join(home, ".claude-work", ".credentials.json"), map[string]any{"claudeAiOauth": map[string]any{
+		"accessToken": "t-work", "expiresAt": float64(far) * 1000, "refreshTokenExpiresAt": float64(1_900_000_000_000)}})
+	up := newUpstream(t)
+	server, acc := start(t, home, up)
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-7d-utilization", "0.42")
+	h.Set("anthropic-ratelimit-unified-5h-reset", "1800000000")
+	acc.recordUsage(account{ID: "work", Email: "work@example.com"}, h)
+	acc.recordUsage(account{ID: "default", Email: "someone-else@example.com"}, h)
+
+	resp, err := http.Get(server.URL + "/_status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(raw), "t-work") || strings.Contains(string(raw), "t-default") {
+		t.Fatal("a token in the status", string(raw))
+	}
+	rows := getStatus(t, server.URL)
+	byID := map[string]accountStatus{}
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	work, def := byID["work"], byID["default"]
+	if work.AuthEnds == nil || *work.AuthEnds != 1_900_000_000 || def.AuthEnds != nil {
+		t.Fatal(work.AuthEnds, def.AuthEnds)
+	}
+	if work.Usage["seven_day_utilization"].Value != 0.42 || work.Usage["five_hour_reset"].Value != 1800000000 || work.Usage["seven_day_utilization"].Observed.IsZero() {
+		t.Fatal(work.Usage)
+	}
+	if def.Usage != nil {
+		t.Fatal("usage recorded for another login is not this account's", def.Usage)
+	}
+}
