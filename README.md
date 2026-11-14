@@ -31,7 +31,7 @@ limitbreak add                       # sign in another account (browser), repeat
 
 Open a new terminal and run `claude` as usual. When one account's limit is hit, the next one answers.
 
-It does the same for Codex on ChatGPT sign-ins, see [Codex](#codex).
+It does the same for Codex on ChatGPT sign-ins, see [Codex](#codex), and for Grok Build, see [Grok](#grok).
 
 ## What it does and does not touch
 
@@ -108,15 +108,42 @@ codex -c openai_base_url="http://127.0.0.1:48617/backend-api/codex"
 - Usage per account comes from `GET /backend-api/wham/usage`, which spends nothing, at most once every 5 minutes, and from the `x-codex-*` headers of each reply.
 - Replaying a turn on another ChatGPT account has not been tried yet with two subscriptions; encrypted reasoning from one account may not be readable by another.
 
+## Grok
+
+The same proxy rotates Grok Build (`grok`, 1.0.77 here) between Grok sign-ins. Point grok at it:
+
+```sh
+GROK_CLI_CHAT_PROXY_BASE_URL="http://127.0.0.1:48617/grok/v1" grok
+# an app gives each agent its own client: http://127.0.0.1:48617/_c/<client>/grok/v1
+```
+
+`grok agent stdio` (ACP) honours the same variable.
+
+What grok's traffic looks like (seen through a capture proxy, grok 1.0.77 on a SuperGrok browser sign-in):
+
+- Every backend request goes to that base, not just the chat: `GET /v1/models`, `GET /v1/settings`, `GET /v1/feedback/config`, `POST /v1/storage`, `POST /v1/traces` (OTLP protobuf), `POST /v1/sessions/<id>/signals` and `/turn-deltas`, and the model turns, `POST /v1/responses` (an OpenAI Responses-style stream, `text/event-stream`, request body `Content-Encoding: zstd`). Without the variable they go to `https://cli-chat-proxy.grok.com/v1`. A `GET /` without credentials is a reachability check (404 upstream).
+- Auth on every one of them: `Authorization: Bearer <session token>` (the `key` in `~/.grok/auth.json`, a JWT from `https://auth.x.ai` that lasts about 6 hours) plus `X-Xai-Token-Auth: xai-grok-cli`. Identity rides along in `X-Email`, `X-Userid`, `X-Grok-User-Id` and, on traces, `X-Teamid`. The variable works with an ordinary browser sign-in, not only an OIDC one: the browser sign-in is stored as `auth_mode: "oidc"` with issuer `https://auth.x.ai`.
+- Replies carry request rate limits (`x-ratelimit-limit-requests`, `-remaining-requests`, `-tokens`), not the plan's usage. The plan's usage is `GET /v1/billing?format=credits`: `config.currentPeriod` (`type` `USAGE_PERIOD_TYPE_WEEKLY`, `start`, `end`) and `config.creditUsagePercent`. It spends nothing.
+
+How limitbreak handles it:
+
+- Accounts are `~/.grok` (the default, grok's own login) and every `~/.grok-<name>` with a login in its `auth.json`. Each named one is a separate grok home (`GROK_HOME`), so its sign-in, lock files and refreshes never touch `~/.grok`. `limitbreak add --provider grok [name]` runs `GROK_HOME=~/.grok-<name> grok login --oauth`; `limitbreak remove --provider grok <name>` deletes that dir (only its `auth.json` when limitbreak did not make it).
+- Clients reach Grok under `/grok`, because its `/v1/…` paths are also Claude's; the prefix comes off before forwarding. Only the model turns (`/v1/responses`, `/v1/chat/completions`, `/v1/messages`) are put on an account. Everything else keeps grok's own login.
+- On the default account a turn keeps grok's own credentials, and limitbreak never refreshes or rewrites `~/.grok` (grok refreshes it with its refresh token). On another account the turn gets that login's token, `X-Xai-Token-Auth` and, where grok sent them, the identity headers above. Body and encoding pass as they are; replies stream back as they arrive.
+- A named login is refreshed by grok itself, never by limitbreak calling the sign-in server: an hour before its token ends, or after a `401`, limitbreak runs `GROK_HOME=<dir> GROK_AUTH_EARLY_INVALIDATION_SECS=86400 grok models` (with no proxy or API key in its environment). The wide window makes grok refresh before it lists models, and the refresh counts only if the token's end moved. Not yet run against a real second login. A login unused for a week may need signing in again (grok's sign-ins are said to last 7 days).
+- Spent: a `402`, or a `403` or `429` whose body says the plan's usage, credits or spending cap ran out (`usage limit`, `weekly limit`, `spending limit`/`cap`, `out of credits`, `usage balance exhausted`, `usage_pool_exhausted`, …) marks the account spent and the same turn goes again on the next account before grok sees it. It stays spent until the body's `resets_at`, else `Retry-After`, else an hour. Any other `403` or `429` (such as "You've hit the rate limit for your plan") goes back to grok unchanged. **This signature is inferred, not observed:** no limit could be triggered. It comes from grok's own error handling (the binary maps HTTP 402/403 to "You hit your free usage limit" / "You hit your weekly limit" / "You've hit your spending cap", and classifies errors whose text contains `usage limit reached`, `out of credits`, `usage balance exhausted`, `spending limit`). If a real limit answers differently (a `200` stream with an error event, say), it reaches grok as it is.
+- Usage per account (`windows`) is the billing period above, read at most once every 5 minutes: `{"id":"weekly","label":"weekly","usedPercent":46,"resetsAt":…,"windowMinutes":10080}`. `authEnds` is null (grok's refresh keeps the sign-in going).
+- Replaying a turn on another Grok account has not been tried yet with two subscriptions; server-side session state (`X-Grok-Conv-Id`, storage) stays on grok's own login.
+
 ## Options
 
-`limitbreak serve --port 48617 --upstream https://api.anthropic.com --codex-upstream https://chatgpt.com --home ~ --credentials auto|keychain|file`
+`limitbreak serve --port 48617 --upstream https://api.anthropic.com --codex-upstream https://chatgpt.com --grok-upstream https://cli-chat-proxy.grok.com --home ~ --credentials auto|keychain|file`
 
-A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding. `/backend-api/…` paths are Codex's, everything else Claude's.
+A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding. `/backend-api/…` paths are Codex's, `/grok/…` paths Grok's (the `/grok` comes off too), everything else Claude's.
 
 Loopback API for apps that show accounts (JSON; fields are only ever added):
 
-- `GET /_status`: every account with `id`, `provider` (`claude` or `codex`), `email`, `label` (the name to show: the email, else the id), `plan` (`max`, `plus`, … or empty), `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null), `windows` and, for Claude, `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). `windows` is the same for every provider: `[{"id":"five_hour","label":"5h","usedPercent":42,"resetsAt":1800000000,"windowMinutes":300,"observed":1799990000}]` (Codex: `primary`, `secondary`; times in unix seconds, `resetsAt` may be null). No token is ever in it.
+- `GET /_status`: every account with `id`, `provider` (`claude`, `codex` or `grok`), `email`, `label` (the name to show: the email, else the id), `plan` (`max`, `plus`, … or empty), `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null), `windows` and, for Claude, `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). `windows` is the same for every provider: `[{"id":"five_hour","label":"5h","usedPercent":42,"resetsAt":1800000000,"windowMinutes":300,"observed":1799990000}]` (Codex: `primary`, `secondary`; Grok: `weekly`, its billing period; times in unix seconds, `resetsAt` may be null). No token is ever in it.
 - `PUT /_c/<client>/_active` with `{"provider":"codex","id":"work"}` (`provider` defaults to `claude`): that client's next request for that provider goes to `work` (it still moves on when `work` is spent). The active account is per client per provider. `404` for an unknown provider or id. Replies with the status list.
 
 For apps, `add` and `remove` speak JSON, one event per line on stdout:

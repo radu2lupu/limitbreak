@@ -27,10 +27,11 @@ limitbreak share <ssh-host>     copy the 1-year tokens to the same-named account
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak video                watch a switch happen as an arcade battle (simulated, no real login touched)
 
-add and remove take --provider claude|codex (default claude) and --json (one JSON event per
+add and remove take --provider claude|codex|grok (default claude) and --json (one JSON event per
 line, for apps; remove --json needs --yes).
 
-The default account is the one plain "claude auth login" signs in (for Codex, "codex login").`
+The default account is the one plain "claude auth login" signs in (for Codex, "codex login";
+for Grok, "grok login").`
 
 var accountName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
@@ -41,16 +42,19 @@ func runCommand(command string, args []string) int {
 		return 1
 	}
 	a := newClaudeAccounts(home, "auto", "")
+	logins := []loginProvider{a,
+		newCodexAccounts(home, "", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream)),
+		newGrokAccounts(home, "", envString("LIMITBREAK_GROK_UPSTREAM", defaultGrokUpstream))}
 	switch command {
 	case "serve":
 		serve(args)
 		return 0
 	case "add", "remove":
-		err = accountCommand(command, args, a, newCodexAccounts(home, "", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream)))
+		err = accountCommand(command, args, logins...)
 	case "video":
 		err = runVideo(os.Stdout)
 	case "list":
-		listAccounts([]loginProvider{a, newCodexAccounts(home, "", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream))}, os.Stdout)
+		listAccounts(logins, os.Stdout)
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
 	case "share":
@@ -79,7 +83,7 @@ func accountCommand(command string, args []string, providers ...loginProvider) e
 		}
 	}
 	if err == nil && lp == nil {
-		err = fmt.Errorf("unknown provider %q; use claude or codex", providerName)
+		err = fmt.Errorf("unknown provider %q; use claude, codex or grok", providerName)
 	}
 	if err != nil {
 		if asJSON {
@@ -111,7 +115,7 @@ func accountFlags(args []string) (provider string, asJSON bool, rest []string, e
 			asJSON = true
 		case arg == "--provider":
 			if i+1 >= len(args) {
-				return provider, asJSON, rest, fmt.Errorf("--provider needs a value: claude or codex")
+				return provider, asJSON, rest, fmt.Errorf("--provider needs a value: claude, codex or grok")
 			}
 			i++
 			provider = args[i]
@@ -187,6 +191,25 @@ func (a *codexAccounts) loginCommand(dir string) (*exec.Cmd, error) {
 }
 
 func (a *codexAccounts) forget(acc account) error { return forgetHomeLogin(acc) }
+
+func (a *grokAccounts) cliNames() cliNames {
+	return cliNames{app: "Grok", login: "grok login", logout: "grok logout"}
+}
+
+func (a *grokAccounts) dirFor(name string) string { return filepath.Join(a.home, ".grok-"+name) }
+
+// loginCommand is grok's browser sign-in into dir as its own GROK_HOME, so the login and grok's
+// lock files land there and never touch ~/.grok.
+func (a *grokAccounts) loginCommand(dir string) (*exec.Cmd, error) {
+	if a.grok == "" {
+		return nil, fmt.Errorf("grok is not installed; install Grok Build first")
+	}
+	cmd := exec.Command(a.grok, "login", "--oauth")
+	cmd.Env, cmd.Dir = grokEnv(dir), dir
+	return cmd, nil
+}
+
+func (a *grokAccounts) forget(acc account) error { return forgetHomeLogin(acc) }
 
 // forgetHomeLogin deletes a login kept as auth.json in a tool's home dir (Codex, Grok). A home dir
 // Limit Break made goes whole; one it found (a ~/.codex-<name> another tool also keeps logs or
@@ -352,6 +375,14 @@ func listAccounts(providers []loginProvider, out io.Writer) {
 					fmt.Fprintf(out, "    auth: Codex's own login, refreshed by Codex\n")
 				} else {
 					fmt.Fprintf(out, "    auth: refreshed by limitbreak through codex app-server\n")
+				}
+				_, windows := a.usage(acc)
+				showWindows(out, windows)
+			case *grokAccounts:
+				if acc.Dir == "" {
+					fmt.Fprintf(out, "    auth: Grok's own login, refreshed by grok\n")
+				} else {
+					fmt.Fprintf(out, "    auth: refreshed by limitbreak through grok\n")
 				}
 				_, windows := a.usage(acc)
 				showWindows(out, windows)

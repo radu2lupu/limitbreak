@@ -24,8 +24,9 @@
 // are, spent-until, auth end, last usage, active-for clients); `PUT /_c/<client>/_active` with
 // `{"id":"<account>"}` sets a client's active account.
 //
-// Codex accounts (ChatGPT sign-ins, codex.go) work the same way under `/backend-api/codex/…`. Each
-// kind of account is a provider (pool.go); the active account is per client per provider.
+// Codex accounts (ChatGPT sign-ins, codex.go) work the same way under `/backend-api/codex/…`, and Grok
+// Build accounts (grok.go) under `/grok/v1/…`. Each kind of account is a provider (pool.go); the
+// active account is per client per provider.
 package main
 
 import (
@@ -455,6 +456,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pl := p.poolFor(path)
+	path = pl.upstreamPath(path)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		apiError(w, http.StatusBadRequest, "bad request")
@@ -508,9 +510,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if resp.StatusCode == http.StatusTooManyRequests {
-			// The reason a 429 is a spent window may be in its body; it is short, so it is read
-			// here and put back in front of the rest for the client.
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// The reason a refusal (a 429; for Grok also a 402 or 403) is a spent window may be in
+			// its body; it is short, so it is read here and put back in front of the rest for the client.
 			peek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body = struct {
 				io.Reader
@@ -550,7 +552,7 @@ func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client strin
 		ID       string `json:"id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.ID == "" {
-		apiError(w, http.StatusBadRequest, `body must be {"provider":"<claude|codex>","id":"<account id>"}`)
+		apiError(w, http.StatusBadRequest, `body must be {"provider":"<claude|codex|grok>","id":"<account id>"}`)
 		return
 	}
 	if body.Provider == "" {
@@ -663,7 +665,8 @@ func serve(args []string) {
 	upstream := flags.String("upstream", envString("LIMITBREAK_UPSTREAM", defaultUpstream), "Anthropic API address")
 	codexUpstream := flags.String("codex-upstream", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream), "ChatGPT backend address for Codex")
 	home, _ := os.UserHomeDir()
-	homeFlag := flags.String("home", home, "home dir holding the Claude and Codex logins")
+	grokUpstream := flags.String("grok-upstream", envString("LIMITBREAK_GROK_UPSTREAM", defaultGrokUpstream), "Grok CLI chat proxy address")
+	homeFlag := flags.String("home", home, "home dir holding the Claude, Codex and Grok logins")
 	credentials := flags.String("credentials", "auto", "auto, keychain or file")
 	_ = flags.Parse(args)
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
@@ -674,7 +677,8 @@ func serve(args []string) {
 	a := newClaudeAccounts(*homeFlag, *credentials, "")
 	go newAuthWatch(a, notifyDesktop).run()
 	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
-	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream))))
+	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
+	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))))
 }
 
 func envString(name, fallback string) string {
