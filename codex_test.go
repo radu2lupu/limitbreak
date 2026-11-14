@@ -300,7 +300,7 @@ func TestANamedCodexLoginIsRefreshedThroughCodexNearItsEndAndAfterA401(t *testin
 	}
 
 	// A token the backend rejects is refreshed and the request sent again on the same account.
-	rig.codex.refreshed = map[string]time.Time{}
+	rig.codex.refreshed = loginRenewal{}
 	rig.refreshes = nil
 	rejected := writeCodexLogin(t, workDir, "work", "acct-work", time.Now().Add(240*time.Hour))
 	rig.up.reply["acct-work"] = func(w http.ResponseWriter) { w.WriteHeader(401) }

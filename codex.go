@@ -31,7 +31,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -222,14 +221,8 @@ type codexAccounts struct {
 	refresh func(dir string) error
 	client  *http.Client
 
-	mu        sync.Mutex
-	refreshed map[string]time.Time
-	usages    map[string]codexUsage
-}
-
-type codexUsage struct {
-	read    time.Time
-	windows []usageWindow
+	refreshed loginRenewal
+	usages    usageCache
 }
 
 func newCodexAccounts(home, codex, upstream string) *codexAccounts {
@@ -237,8 +230,7 @@ func newCodexAccounts(home, codex, upstream string) *codexAccounts {
 		codex, _ = exec.LookPath("codex")
 	}
 	return &codexAccounts{home: home, codex: codex, upstream: strings.TrimRight(upstream, "/"), now: time.Now,
-		refresh: appServerRefresh(codex), client: &http.Client{Timeout: 10 * time.Second},
-		refreshed: map[string]time.Time{}, usages: map[string]codexUsage{}}
+		refresh: appServerRefresh(codex), client: &http.Client{Timeout: 10 * time.Second}}
 }
 
 func (a *codexAccounts) name() string { return "codex" }
@@ -306,22 +298,7 @@ func (a *codexAccounts) authorize(out *http.Request, acc account) bool {
 
 // renew refreshes a named login through Codex, at most once per codexRefreshEvery; true when it did.
 func (a *codexAccounts) renew(acc account) bool {
-	if acc.Dir == "" || a.refresh == nil {
-		return false
-	}
-	a.mu.Lock()
-	if last, ok := a.refreshed[acc.ID]; ok && a.now().Sub(last) < codexRefreshEvery {
-		a.mu.Unlock()
-		return false
-	}
-	a.refreshed[acc.ID] = a.now()
-	a.mu.Unlock()
-	if err := a.refresh(acc.Path); err != nil {
-		log.Printf("codex account %s: refresh failed: %v", acc.ID, err)
-		return false
-	}
-	log.Printf("codex account %s refreshed through codex app-server", acc.ID)
-	return true
+	return a.refreshed.renew(a.name(), "codex app-server", acc, a.now(), codexRefreshEvery, a.refresh)
 }
 
 func (a *codexAccounts) spent(status int, _ http.Header, body []byte) (bool, time.Time) {
@@ -336,9 +313,7 @@ func (a *codexAccounts) observe(acc account, h http.Header) time.Time {
 	if len(windows) == 0 {
 		return time.Time{}
 	}
-	a.mu.Lock()
-	a.usages[acc.ID] = codexUsage{read: now, windows: windows}
-	a.mu.Unlock()
+	a.usages.put(acc.ID, now, windows)
 	return usedUp(windows, now)
 }
 
@@ -355,23 +330,10 @@ func (a *codexAccounts) unauthorized(acc account) (retry, handBack bool) {
 // usage is the account's windows from `GET /backend-api/wham/usage` (it spends nothing), read at
 // most once per codexUsageEvery; a failed read keeps the last windows. It never refreshes a login.
 func (a *codexAccounts) usage(acc account) (map[string]usageValue, []usageWindow) {
-	now := a.now()
-	a.mu.Lock()
-	cached, ok := a.usages[acc.ID]
-	if ok && now.Sub(cached.read) < codexUsageEvery {
-		a.mu.Unlock()
-		return nil, cached.windows
-	}
-	a.usages[acc.ID] = codexUsage{read: now, windows: cached.windows}
-	a.mu.Unlock()
-	windows, err := a.readUsage(acc)
+	windows, err := a.usages.get(acc.ID, a.now(), codexUsageEvery, func() ([]usageWindow, error) { return a.readUsage(acc) })
 	if err != nil {
 		log.Printf("codex account %s: usage read failed: %v", acc.ID, err)
-		return nil, cached.windows
 	}
-	a.mu.Lock()
-	a.usages[acc.ID] = codexUsage{read: now, windows: windows}
-	a.mu.Unlock()
 	return nil, windows
 }
 
