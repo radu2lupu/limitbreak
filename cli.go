@@ -186,9 +186,12 @@ func (a *codexAccounts) loginCommand(dir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// forget deletes a Codex login. A home dir Limit Break made goes whole; one it found (a
-// ~/.codex-<name> another tool also keeps logs or sessions in) loses only its auth.json.
-func (a *codexAccounts) forget(acc account) error {
+func (a *codexAccounts) forget(acc account) error { return forgetHomeLogin(acc) }
+
+// forgetHomeLogin deletes a login kept as auth.json in a tool's home dir (Codex, Grok). A home dir
+// Limit Break made goes whole; one it found (a ~/.codex-<name> another tool also keeps logs or
+// sessions in) loses only its auth.json.
+func forgetHomeLogin(acc account) error {
 	if _, err := os.Stat(filepath.Join(acc.Dir, createdMarker)); err == nil {
 		return os.RemoveAll(acc.Dir)
 	}
