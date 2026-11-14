@@ -113,6 +113,11 @@ func TestSessionTranscriptFindsProjectAndTitleUnderAnyClaudeDir(t *testing.T) {
 	if got := sessionTranscript(home, "s-custom"); got.Title != "Named by me" {
 		t.Fatalf("%+v", got)
 	}
+	writeTranscript(t, filepath.Join(home, "Library", "Application Support", "Hi, computer", "mesh-acp", "member_agent_x", "home", "revisions", "12", ".claude", "projects", "-x", "s-mesh.jsonl"),
+		`{"type":"user","message":{"role":"user","content":"agent work"},"cwd":"/srv/agent"}`)
+	if got := sessionTranscript(home, "s-mesh"); got.Project != "/srv/agent" || got.Title != "agent work" {
+		t.Fatalf("%+v", got)
+	}
 	if got := sessionTranscript(home, "nope"); got != (transcriptInfo{"?", "?"}) {
 		t.Fatalf("%+v", got)
 	}

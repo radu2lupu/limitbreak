@@ -300,7 +300,8 @@ func sessionTranscript(home, id string) transcriptInfo {
 		return unknown
 	}
 	var matches []string
-	for _, dir := range []string{".claude", ".claude-*"} {
+	// Hi, computer (which ships limitbreak) runs each agent with its own home, one per revision.
+	for _, dir := range []string{".claude", ".claude-*", "Library/Application Support/Hi, computer/mesh-acp/*/home/revisions/*/.claude"} {
 		found, _ := filepath.Glob(filepath.Join(home, dir, "projects", "*", id+".jsonl"))
 		matches = append(matches, found...)
 	}

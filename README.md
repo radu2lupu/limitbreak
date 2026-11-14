@@ -108,7 +108,7 @@ d7ecca82  ~/Code/app     Gallery scrubber tab labels    212  41k    1.9M     88M
 f18dfb1d  ~/Code/other   Auto planning status check     40   6k     300k     9.1M     52k     1.5M      +3   -
 ```
 
-A session's project and title come from its transcript (`~/.claude*/projects/*/<session>.jsonl`): the title it was given, else Claude Code's own title, else its first prompt. `WEIGHTED` counts tokens at the API's price ratios (input 1, cache write 1.25, cache read 0.1, output 5), which roughly track what the limits count. `5H` and `7D` are the percentage points the account's windows rose on that group's replies; a fall is a window reset and counts for no one. Utilization moves in 1% steps and sessions on one account share its window, so these are approximate.
+A session's project and title come from its transcript (`~/.claude*/projects/*/<session>.jsonl`, or a Hi, computer agent's own home): the title it was given, else Claude Code's own title, else its first prompt. `WEIGHTED` counts tokens at the API's price ratios (input 1, cache write 1.25, cache read 0.1, output 5), which roughly track what the limits count. `5H` and `7D` are the percentage points the account's windows rose on that group's replies; a fall is a window reset and counts for no one. Utilization moves in 1% steps and sessions on one account share its window, so these are approximate.
 
 ## Codex
 
