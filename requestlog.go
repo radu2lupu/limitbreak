@@ -56,10 +56,17 @@ type requestRecord struct {
 	// The reply's 5-hour and 7-day utilization (0..1); absent when its headers did not say.
 	FiveHour *float64 `json:"five_hour_utilization,omitempty"`
 	SevenDay *float64 `json:"seven_day_utilization,omitempty"`
+	// Backfilled marks a record rebuilt from a transcript (backfill.go), not seen by the proxy.
+	Backfilled bool `json:"backfilled,omitempty"`
 }
 
 func requestsPath(home string) string {
 	return filepath.Join(filepath.Dir(usagePath(home)), "requests.jsonl")
+}
+
+// requestsBackfillPath holds the records `limitbreak backfill` rebuilt from transcripts.
+func requestsBackfillPath(home string) string {
+	return filepath.Join(filepath.Dir(usagePath(home)), "requests.backfill.jsonl")
 }
 
 // MARK: Decisions (pure)

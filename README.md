@@ -110,6 +110,8 @@ f18dfb1d  ~/Code/other   Auto planning status check     40   6k     300k     9.1
 
 A session's project and title come from its transcript (`~/.claude*/projects/*/<session>.jsonl`, or a Hi, computer agent's own home): the title it was given, else Claude Code's own title, else its first prompt. `WEIGHTED` counts tokens at the API's price ratios (input 1, cache write 1.25, cache read 0.1, output 5), which roughly track what the limits count. `5H` and `7D` are the percentage points the account's windows rose on that group's replies; a fall is a window reset and counts for no one. Utilization moves in 1% steps and sessions on one account share its window, so these are approximate.
 
+`limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]` (default: since local midnight) rebuilds records for the replies before the log began from Claude Code's transcripts (the same dirs, subagent transcripts counted to their parent session), each reply once, and only up to the first record the proxy logged itself, so nothing counts twice. It replaces `requests.backfill.jsonl` beside the log, so it can be rerun; `blame` reads it too and marks those rows `*`. Their account is inferred from the switch log (`?` before a client's first logged switch; Hi, computer agents are their own `/_c/<client>`, everything else `shared`). A client can also move without a line of its own and a request that bypassed the proxy looks the same, so treat it as a guess; they have no 5h/7d.
+
 ## Codex
 
 The same proxy rotates Codex between ChatGPT sign-ins. Point Codex at it:

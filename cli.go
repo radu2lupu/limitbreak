@@ -27,6 +27,9 @@ limitbreak share <ssh-host>     copy the 1-year tokens to the same-named account
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client] [--json]
                                 which sessions used the limits (from the request log)
+limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]
+                                rebuild the request log before it began from Claude Code transcripts
+                                (default: since local midnight; the account is inferred from the switch log)
 limitbreak video                watch a switch happen as an arcade battle (simulated, no real login touched)
 
 add and remove take --provider claude|codex|grok (default claude) and --json (one JSON event per
@@ -59,6 +62,8 @@ func runCommand(command string, args []string) int {
 		listAccounts(logins, os.Stdout)
 	case "blame":
 		err = blameCommand(home, args, os.Stdout)
+	case "backfill":
+		err = backfillCommand(home, args, time.Now(), os.Stdout)
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
 	case "share":

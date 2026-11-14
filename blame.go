@@ -58,6 +58,8 @@ type blameRow struct {
 	// (see utilizationRises).
 	FiveHourRise float64 `json:"five_hour_rise"`
 	SevenDayRise float64 `json:"seven_day_rise"`
+	// Backfilled counts the replies rebuilt from transcripts (no utilization, account inferred).
+	Backfilled int `json:"backfilled"`
 }
 
 // transcriptInfo is what a session's transcript says about it; "?" where it says nothing.
@@ -149,6 +151,9 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 		row.Weighted += weighted(rec.tokenUsage)
 		row.FiveHourRise += rise5[i]
 		row.SevenDayRise += rise7[i]
+		if rec.Backfilled {
+			row.Backfilled++
+		}
 	}
 	rows := make([]blameRow, 0, len(groups))
 	for _, row := range groups {
@@ -293,6 +298,13 @@ func tildePath(home, path string) string {
 
 var sessionID = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
 
+// meshACPDir holds Hi, computer's agents (Hi, computer ships limitbreak): each runs with its own
+// home, one per revision, under <client>/home/revisions/<n>, and reaches the proxy as /_c/<client>.
+const meshACPDir = "Library/Application Support/Hi, computer/mesh-acp"
+
+// claudeConfigGlobs are the Claude config dirs under home whose projects/ hold session transcripts.
+var claudeConfigGlobs = []string{".claude", ".claude-*", meshACPDir + "/*/home/revisions/*/.claude"}
+
 // sessionTranscript is what the transcript of session id says, under any Claude config dir of home.
 func sessionTranscript(home, id string) transcriptInfo {
 	unknown := transcriptInfo{Project: "?", Title: "?"}
@@ -300,8 +312,7 @@ func sessionTranscript(home, id string) transcriptInfo {
 		return unknown
 	}
 	var matches []string
-	// Hi, computer (which ships limitbreak) runs each agent with its own home, one per revision.
-	for _, dir := range []string{".claude", ".claude-*", "Library/Application Support/Hi, computer/mesh-acp/*/home/revisions/*/.claude"} {
+	for _, dir := range claudeConfigGlobs {
 		found, _ := filepath.Glob(filepath.Join(home, dir, "projects", "*", id+".jsonl"))
 		matches = append(matches, found...)
 	}
@@ -325,10 +336,11 @@ func sessionTranscript(home, id string) transcriptInfo {
 	return info
 }
 
-// readRequests is every record in the request log, the rotated file's first; bad lines are skipped.
+// readRequests is every record in the request log, the backfilled ones and the rotated file's
+// first; bad lines are skipped.
 func readRequests(home string) ([]requestRecord, error) {
 	var out []requestRecord
-	for _, path := range []string{requestsPath(home) + ".1", requestsPath(home)} {
+	for _, path := range []string{requestsBackfillPath(home), requestsPath(home) + ".1", requestsPath(home)} {
 		f, err := os.Open(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -400,12 +412,17 @@ func showBlame(out io.Writer, rows []blameRow, by string) {
 	} else {
 		fmt.Fprintln(tw, strings.ToUpper(by)+"\t"+numbers)
 	}
+	rebuilt := false
 	for _, row := range rows {
 		key := row.Key
+		if by == "session" && len(key) > 8 {
+			key = key[:8]
+		}
+		if row.Backfilled > 0 {
+			key += "*"
+			rebuilt = true
+		}
 		if by == "session" {
-			if len(key) > 8 {
-				key = key[:8]
-			}
 			key += "\t" + cmp.Or(row.Project, "?") + "\t" + cmp.Or(row.Title, "?")
 		}
 		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", key, row.Requests,
@@ -414,4 +431,7 @@ func showBlame(out io.Writer, rows []blameRow, by string) {
 			humanize(row.Weighted), points(row.FiveHourRise), points(row.SevenDayRise))
 	}
 	tw.Flush()
+	if rebuilt {
+		fmt.Fprintln(out, "* rebuilt from transcripts: account inferred from the switch log, no 5h/7d")
+	}
 }
