@@ -1,6 +1,6 @@
 package main
 
-// A provider is one kind of account (Claude, Codex; more later): where its logins live, how a request is
+// A provider is one kind of account (Claude, Codex, Grok): where its logins live, how a request is
 // put on one, how a reply says the account is spent, and what its usage is. A pool is one
 // provider's accounts as the proxy rotates them: which one each client is on, and which are spent
 // until when. What differs between providers is behind the interface; the rotation is the pool's.
@@ -15,7 +15,7 @@ import (
 )
 
 type provider interface {
-	// name is the provider's id in the API ("claude", "codex").
+	// name is the provider's id in the API ("claude", "codex", "grok").
 	name() string
 	// list is every account with a login, read now, the default one first.
 	list() []account
@@ -27,7 +27,7 @@ type provider interface {
 	// client's own); false when the account has none usable now.
 	authorize(out *http.Request, acc account) bool
 	// spent is whether a reply says the account's window is spent, and when it lifts (zero when
-	// unsaid). body is the start of a 429's body, nil for any other reply.
+	// unsaid). body is the start of a 4xx reply's body, nil for any other reply.
 	spent(status int, h http.Header, body []byte) (bool, time.Time)
 	// observe records what a reply's headers say about the account's usage. A non-zero time
 	// means they show a window already used up, until then.
@@ -39,6 +39,20 @@ type provider interface {
 	// usage is the account's raw usage values by name (nil when the provider keeps none) and its
 	// windows, normalised.
 	usage(acc account) (map[string]usageValue, []usageWindow)
+}
+
+// A mounted provider's upstream paths collide with another provider's (Grok's /v1/… with Claude's), so
+// clients reach it under a path prefix of its own, which comes off before the request goes upstream.
+type mounted interface {
+	mount() string
+}
+
+// upstreamPath is path as the pool's upstream knows it: without the provider's mount.
+func (p *pool) upstreamPath(path string) string {
+	if m, ok := p.provider.(mounted); ok {
+		return strings.TrimPrefix(path, m.mount())
+	}
+	return path
 }
 
 type pool struct {
@@ -170,7 +184,7 @@ func (p *pool) setActive(client, id string) bool {
 
 type accountStatus struct {
 	ID string `json:"id"`
-	// Provider is the kind of account: "claude" or "codex". Absent means "claude".
+	// Provider is the kind of account: "claude", "codex" or "grok". Absent means "claude".
 	Provider string `json:"provider"`
 	Email    string `json:"email,omitempty"`
 	// Label is the name to show for the account: its email when known, else its id.
@@ -228,6 +242,83 @@ func (p *pool) status() []accountStatus {
 		}
 	}
 	return out
+}
+
+// MARK: Shared by providers
+
+// loginRenewal lets each named login be refreshed at most once per `every`, so a failing refresh
+// is not retried on every request. The zero value is ready to use.
+type loginRenewal struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// renew runs refresh (the provider's own tool, named by through) on a named login's dir unless it
+// ran within every; true when it ran and worked. The default login is never refreshed from here.
+func (g *loginRenewal) renew(provider, through string, acc account, now time.Time, every time.Duration, refresh func(dir string) error) bool {
+	if acc.Dir == "" || refresh == nil {
+		return false
+	}
+	g.mu.Lock()
+	if last, ok := g.last[acc.ID]; ok && now.Sub(last) < every {
+		g.mu.Unlock()
+		return false
+	}
+	if g.last == nil {
+		g.last = map[string]time.Time{}
+	}
+	g.last[acc.ID] = now
+	g.mu.Unlock()
+	if err := refresh(acc.Path); err != nil {
+		log.Printf("%s account %s: refresh failed: %v", provider, acc.ID, err)
+		return false
+	}
+	log.Printf("%s account %s refreshed through %s", provider, acc.ID, through)
+	return true
+}
+
+// usageCache is each account's windows as last read from its provider's server, so a status asks
+// that server at most once per `every` per account. The zero value is ready to use.
+type usageCache struct {
+	mu   sync.Mutex
+	byID map[string]cachedUsage
+}
+
+type cachedUsage struct {
+	read    time.Time
+	windows []usageWindow
+}
+
+// put keeps windows seen now (in a reply's headers, say: fresher than a read).
+func (c *usageCache) put(id string, now time.Time, windows []usageWindow) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byID == nil {
+		c.byID = map[string]cachedUsage{}
+	}
+	c.byID[id] = cachedUsage{read: now, windows: windows}
+}
+
+// get is the account's windows: the kept ones when read within every, else read now. A failed read
+// keeps the last windows, returns its error, and is not tried again before every has passed.
+func (c *usageCache) get(id string, now time.Time, every time.Duration, read func() ([]usageWindow, error)) ([]usageWindow, error) {
+	c.mu.Lock()
+	cached, ok := c.byID[id]
+	if ok && now.Sub(cached.read) < every {
+		c.mu.Unlock()
+		return cached.windows, nil
+	}
+	if c.byID == nil {
+		c.byID = map[string]cachedUsage{}
+	}
+	c.byID[id] = cachedUsage{read: now, windows: cached.windows}
+	c.mu.Unlock()
+	windows, err := read()
+	if err != nil {
+		return cached.windows, err
+	}
+	c.put(id, now, windows)
+	return windows, nil
 }
 
 // accountLabel is the one rule for naming an account to a person: its email, else its id.
