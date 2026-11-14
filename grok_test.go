@@ -474,7 +474,7 @@ func runFakeGrok(args []string) int {
 	switch {
 	case len(args) == 2 && args[0] == "login" && args[1] == "--oauth":
 		fmt.Println("To sign in, open this URL in your browser:")
-		fmt.Fprint(os.Stdout, "https://auth.x.ai/oauth2/auth?client_id=grok-cli&redirect_uri=http%3A%2F%2F127.0.0.1%3A5555%2Fcallback&state=abc\n")
+		fmt.Printf("%s\n", fakeGrokSignInURL)
 		if name == "fail" {
 			fmt.Fprintln(os.Stderr, "Authorization denied.")
 			return 1
@@ -596,3 +596,7 @@ func TestListShowsGrokAccountsWithTheirWindow(t *testing.T) {
 		}
 	}
 }
+
+// fakeGrokSignInURL is what the fake grok prints as its sign-in page. A constant, so go vet does not read its
+// escaped characters as Printf directives.
+const fakeGrokSignInURL = "https://auth.x.ai/oauth2/auth?client_id=grok-cli&redirect_uri=http%3A%2F%2F127.0.0.1%3A5555%2Fcallback&state=abc"
