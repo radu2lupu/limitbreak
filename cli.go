@@ -1010,7 +1010,11 @@ func importToken(a *claudeAccounts, args []string, validate tokenValidator, in i
 		}
 	}
 	if target == nil {
-		return fmt.Errorf("no account named %q here; sign it in first (limitbreak add %s)", args[0], args[0])
+		acc, err := a.tokenOnlyAccount(args[0])
+		if err != nil {
+			return err
+		}
+		target = &acc
 	}
 	if status, err := validate(t.Token); err == nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
 		return fmt.Errorf("Anthropic rejected the token (HTTP %d); not stored", status)
@@ -1020,4 +1024,21 @@ func importToken(a *claudeAccounts, args []string, validate tokenValidator, in i
 	}
 	fmt.Fprintf(out, "%s now has a 1-year token until %s.\n", target.ID, day(time.UnixMilli(t.ExpiresAt)))
 	return nil
+}
+
+// tokenOnlyAccount is a new account for a token shared from another machine whose account was never
+// signed in here: its dir is made, and the 1-year token stored in it is what makes it an account.
+func (a *claudeAccounts) tokenOnlyAccount(name string) (account, error) {
+	if name == defaultID || !accountName.MatchString(name) {
+		return account{}, fmt.Errorf("no account named %q here; sign it in first (limitbreak add %s)", name, name)
+	}
+	dir := a.dirFor(name)
+	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+		// Another tool's dir with the same name: never claim it.
+		return account{}, fmt.Errorf("%s already exists and is not a login here; sign it in first (limitbreak add %s)", dir, name)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return account{}, err
+	}
+	return account{ID: name, Dir: dir, Path: dir}, nil
 }

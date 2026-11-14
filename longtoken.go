@@ -256,3 +256,9 @@ func notifyDesktop(message string) {
 		"-e", `display notification (item 1 of argv) with title "limitbreak"`,
 		"-e", "end run", message).Run()
 }
+
+// hasLongToken reports whether the account has a stored 1-year token that has not expired.
+func (a *claudeAccounts) hasLongToken(acc account) bool {
+	t, ok := a.readLongToken(acc)
+	return ok && t.valid(a.now())
+}

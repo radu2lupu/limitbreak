@@ -250,8 +250,9 @@ func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
 	}
 	var out bytes.Buffer
 	err := shareTokens(src, []string{"mini"}, send, &out)
-	// spare does not exist on the destination, so it fails; work is skipped as expired.
-	if err == nil || !strings.Contains(err.Error(), "spare") || !strings.Contains(out.String(), "work has no 1-year token") {
+	// spare was never signed in on the destination: it arrives as a token-only account. work is
+	// skipped as expired.
+	if err != nil || !strings.Contains(out.String(), "work has no 1-year token") {
 		t.Fatal(err, out.String())
 	}
 	if got := dst.readToken(accountNamed(t, dst, "default")); got != "sk-ant-oat01-def" {
@@ -259,6 +260,17 @@ func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
 	}
 	if got := dst.readToken(accountNamed(t, dst, "work")); got != "y" {
 		t.Fatal(got)
+	}
+	if got := dst.readToken(accountNamed(t, dst, "spare")); got != "sk-ant-oat01-spare" {
+		t.Fatal(got)
+	}
+	// A same-named dir another tool keeps is never claimed.
+	other := filepath.Join(dst.home, ".claude-other")
+	os.MkdirAll(other, 0o700)
+	os.WriteFile(filepath.Join(other, "notes"), nil, 0o600)
+	record0, _ := json.Marshal(newLongToken("sk-ant-oat01-x", now))
+	if importToken(dst, []string{"other"}, ok, bytes.NewReader(record0), &bytes.Buffer{}) == nil {
+		t.Fatal("another tool's dir was claimed")
 	}
 
 	rejected := func(string) (int, error) { return 401, nil }

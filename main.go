@@ -196,6 +196,10 @@ func (a *claudeAccounts) list() []account {
 		if s := a.credentialSources(path, path); len(s) > 0 {
 			found = append(found, account{ID: strings.TrimPrefix(name, ".claude-"), Dir: path, Path: path})
 			sources = append(sources, s)
+		} else if acc := (account{ID: strings.TrimPrefix(name, ".claude-"), Dir: path, Path: path}); a.hasLongToken(acc) {
+			// No sign-in here, only a 1-year token shared from another machine (`limitbreak share`).
+			found = append(found, acc)
+			sources = append(sources, nil)
 		}
 	}
 	for i := range found {
