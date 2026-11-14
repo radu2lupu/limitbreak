@@ -474,7 +474,7 @@ func runFakeGrok(args []string) int {
 	switch {
 	case len(args) == 2 && args[0] == "login" && args[1] == "--oauth":
 		fmt.Println("To sign in, open this URL in your browser:")
-		fmt.Println("https://auth.x.ai/oauth2/auth?client_id=grok-cli&redirect_uri=http%3A%2F%2F127.0.0.1%3A5555%2Fcallback&state=abc")
+		fmt.Fprint(os.Stdout, "https://auth.x.ai/oauth2/auth?client_id=grok-cli&redirect_uri=http%3A%2F%2F127.0.0.1%3A5555%2Fcallback&state=abc\n")
 		if name == "fail" {
 			fmt.Fprintln(os.Stderr, "Authorization denied.")
 			return 1
