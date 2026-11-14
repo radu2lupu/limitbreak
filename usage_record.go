@@ -51,17 +51,25 @@ func readUsage(home string) (map[string]usageRecord, error) {
 	return records, nil
 }
 
+// usageHeader is the named usage value (a usageHeaders key) in a reply's headers; false when it is
+// absent or not a sane value (a utilization is a fraction, 0..1).
+func usageHeader(h http.Header, name string) (float64, bool) {
+	value, err := strconv.ParseFloat(h.Get(usageHeaders[name]), 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return 0, false
+	}
+	if (name == "five_hour_utilization" || name == "seven_day_utilization") && value > 1 {
+		return 0, false
+	}
+	return value, true
+}
+
 func (a *claudeAccounts) recordUsage(acc account, h http.Header) {
 	values := map[string]usageValue{}
-	for name, header := range usageHeaders {
-		value, err := strconv.ParseFloat(h.Get(header), 64)
-		if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			continue
+	for name := range usageHeaders {
+		if value, ok := usageHeader(h, name); ok {
+			values[name] = usageValue{Value: value, Observed: a.now().UTC()}
 		}
-		if (name == "five_hour_utilization" || name == "seven_day_utilization") && value > 1 {
-			continue
-		}
-		values[name] = usageValue{Value: value, Observed: a.now().UTC()}
 	}
 	if len(values) == 0 {
 		return
