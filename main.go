@@ -407,6 +407,8 @@ type proxy struct {
 	// pools are the providers' accounts; the first one answers every path no other one serves.
 	pools  []*pool
 	client *http.Client
+	// requests is where Claude inference replies are logged (requestlog.go); nil logs nothing.
+	requests *requestLog
 }
 
 func newProxy(pools ...*pool) *proxy {
@@ -466,8 +468,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "bad request")
 		return
 	}
+	meta := p.requestMeta(pl, clientName, path, r, body)
 	if !pl.provider.spends(path) {
-		p.passThrough(w, r, pl.upstream+path, body)
+		p.passThrough(w, r, pl.upstream+path, body, nil)
 		return
 	}
 	renewed := map[string]bool{}
@@ -475,7 +478,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		acc := pl.current(clientName)
 		if acc == nil {
 			// Nothing to switch to (no login, or every account spent): the client's own login answers.
-			p.passThrough(w, r, pl.upstream+path, body)
+			p.passThrough(w, r, pl.upstream+path, body, meta)
 			return
 		}
 		out, err := upstreamRequest(r, pl.upstream+path, body)
@@ -488,7 +491,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if pl.spend(clientName, acc.ID, pl.now().Add(unavailableBackoff)) != nil {
 				continue
 			}
-			p.passThrough(w, r, pl.upstream+path, body)
+			p.passThrough(w, r, pl.upstream+path, body, meta)
 			return
 		}
 		resp, err := p.client.Do(out)
@@ -510,7 +513,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if pl.spend(clientName, acc.ID, pl.now().Add(unavailableBackoff)) != nil {
 					continue
 				}
-				p.passThrough(w, r, pl.upstream+path, body)
+				p.passThrough(w, r, pl.upstream+path, body, meta)
 				return
 			}
 		}
@@ -531,6 +534,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				spentAhead = time.Time{}
 			}
 		}
+		meta.watch(resp, acc.ID)
 		relay(w, resp)
 		if !spentAhead.IsZero() {
 			// This reply got through, but it says a window is now used up: the next request goes
@@ -539,7 +543,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	p.passThrough(w, r, pl.upstream+path, body)
+	p.passThrough(w, r, pl.upstream+path, body, meta)
 }
 
 // serveActive answers `PUT /_c/<client>/_active` with `{"provider":"codex","id":"<account id>"}`
@@ -609,7 +613,8 @@ func upstreamRequest(r *http.Request, target string, body []byte) (*http.Request
 }
 
 // passThrough sends the request upstream exactly as the client made it, with its own credentials.
-func (p *proxy) passThrough(w http.ResponseWriter, r *http.Request, target string, body []byte) {
+// meta (nil when not logged) records the reply as the client's own login's.
+func (p *proxy) passThrough(w http.ResponseWriter, r *http.Request, target string, body []byte, meta *requestMeta) {
 	out, err := upstreamRequest(r, target, body)
 	if err != nil {
 		apiError(w, http.StatusBadRequest, "bad path")
@@ -620,6 +625,7 @@ func (p *proxy) passThrough(w http.ResponseWriter, r *http.Request, target strin
 		apiError(w, http.StatusBadGateway, "upstream unreachable")
 		return
 	}
+	meta.watch(resp, ownAccount)
 	relay(w, resp)
 }
 
@@ -682,7 +688,9 @@ func serve(args []string) {
 	go newAuthWatch(a, notifyDesktop).run()
 	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
-	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))))
+	px := newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))
+	px.requests = newRequestLog(*homeFlag)
+	log.Fatal(http.Serve(listener, px))
 }
 
 func envString(name, fallback string) string {

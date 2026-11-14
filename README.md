@@ -91,6 +91,25 @@ To use the same tokens on another machine of yours, install limitbreak there, th
 
 `limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
 
+## Which sessions used the limits
+
+The proxy appends one JSON line per Claude `/v1/messages` reply to `~/.local/state/limitbreak/requests.jsonl` (mode 600): the time, client (`/_c/<client>` or `shared`), the account that answered (`own` when it went on Claude Code's own login because no account could take it), the Claude Code session id (`X-Claude-Code-Session-Id`), the agent (`sdk` or `cli`), model, status, the reply's token counts (input, cache write, cache read, output) and the 5-hour and 7-day utilization from its headers. It records no prompt or reply text and no token. A retried spent reply is not logged; the reply the client got is. Past 20 MB the file moves to `requests.jsonl.1` (replacing an older one). Codex and Grok requests are not logged.
+
+```sh
+limitbreak blame                       # last 24h, by session
+limitbreak blame --since 7d --by project
+limitbreak blame --account own         # what burned your own login
+limitbreak blame --by account --json   # also: --by client
+```
+
+```
+SESSION   PROJECT        TITLE                          REQ  INPUT  CACHE W  CACHE R  OUTPUT  WEIGHTED  5H   7D
+d7ecca82  ~/Code/app     Gallery scrubber tab labels    212  41k    1.9M     88M      610k    14M       +23  +4
+f18dfb1d  ~/Code/other   Auto planning status check     40   6k     300k     9.1M     52k     1.5M      +3   -
+```
+
+A session's project and title come from its transcript (`~/.claude*/projects/*/<session>.jsonl`): the title it was given, else Claude Code's own title, else its first prompt. `WEIGHTED` counts tokens at the API's price ratios (input 1, cache write 1.25, cache read 0.1, output 5), which roughly track what the limits count. `5H` and `7D` are the percentage points the account's windows rose on that group's replies; a fall is a window reset and counts for no one. Utilization moves in 1% steps and sessions on one account share its window, so these are approximate.
+
 ## Codex
 
 The same proxy rotates Codex between ChatGPT sign-ins. Point Codex at it:
