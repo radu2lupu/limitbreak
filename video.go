@@ -53,7 +53,7 @@ func runVideo(out io.Writer) error {
 	}))
 	defer anthropic.Close()
 
-	proxy := httptest.NewServer(newProxy(newAccounts(home, credentialsFile, ""), anthropic.URL))
+	proxy := httptest.NewServer(newProxy(newPool(newClaudeAccounts(home, credentialsFile, ""), anthropic.URL)))
 	defer proxy.Close()
 
 	log.SetOutput(io.Discard)

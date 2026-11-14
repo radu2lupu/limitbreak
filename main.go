@@ -23,6 +23,9 @@
 // forwarded untouched with Claude Code's own credentials. `GET /_status` lists the accounts (who they
 // are, spent-until, auth end, last usage, active-for clients); `PUT /_c/<client>/_active` with
 // `{"id":"<account>"}` sets a client's active account.
+//
+// Codex accounts (ChatGPT sign-ins, codex.go) work the same way under `/backend-api/codex/…`. Each
+// kind of account is a provider (pool.go); the active account is per client per provider.
 package main
 
 import (
@@ -65,11 +68,6 @@ const (
 	credentialsKeychain = "keychain"
 	credentialsFile     = "file"
 )
-
-var hopHeaders = map[string]bool{
-	"Host": true, "Authorization": true, "X-Api-Key": true, "Content-Length": true, "Connection": true,
-	"Accept-Encoding": true, "Transfer-Encoding": true, "Proxy-Connection": true, "Keep-Alive": true, "Expect": true,
-}
 
 // MARK: Decisions (pure)
 
@@ -129,7 +127,7 @@ func nextAccount(order []account, current string, spentUntil map[string]time.Tim
 	return nil
 }
 
-// MARK: Accounts
+// MARK: Claude accounts
 
 type account struct {
 	ID    string `json:"id"`
@@ -140,22 +138,24 @@ type account struct {
 	// AuthEnds is when the account stops being usable without the user (see authEnd); zero when
 	// no source states it. Read at discovery, so `GET /_status` does not ask the Keychain.
 	AuthEnds time.Time `json:"-"`
+	// Plan is the subscription the login is on ("max", "plus"); empty when unknown.
+	Plan string `json:"-"`
+	// Who identifies the subscription behind the login: two accounts with the same Who add no
+	// capacity. Claude: the email. Codex: the ChatGPT user and workspace.
+	Who string `json:"-"`
 }
 
-type accounts struct {
+// claudeAccounts is the Claude provider: the logins Claude Code holds on this host.
+type claudeAccounts struct {
 	home        string
 	credentials string
 	claude      string
 	now         func() time.Time
-
-	mu           sync.Mutex
-	discovered   []account
-	discoveredAt time.Time
-	active       map[string]string
-	spentUntil   map[string]time.Time
+	// mu serializes writes to the usage record.
+	mu sync.Mutex
 }
 
-func newAccounts(home, credentials, claude string) *accounts {
+func newClaudeAccounts(home, credentials, claude string) *claudeAccounts {
 	if credentials == "auto" {
 		credentials = credentialsFile
 		if runtime.GOOS == "darwin" {
@@ -165,19 +165,12 @@ func newAccounts(home, credentials, claude string) *accounts {
 	if claude == "" {
 		claude, _ = exec.LookPath("claude")
 	}
-	return &accounts{home: home, credentials: credentials, claude: claude, now: time.Now,
-		active: map[string]string{}, spentUntil: map[string]time.Time{}}
+	return &claudeAccounts{home: home, credentials: credentials, claude: claude, now: time.Now}
 }
 
-func (a *accounts) list() []account {
-	a.mu.Lock()
-	if len(a.discovered) > 0 && a.now().Sub(a.discoveredAt) < discoveryInterval {
-		out := append([]account(nil), a.discovered...)
-		a.mu.Unlock()
-		return out
-	}
-	a.mu.Unlock()
-
+// list is every Claude login on the host, read now: the default one first, then each
+// `~/.claude-<name>` dir that holds a login, by name.
+func (a *claudeAccounts) list() []account {
 	var found []account
 	var sources [][][]byte
 	defaultDir := filepath.Join(a.home, ".claude")
@@ -206,15 +199,14 @@ func (a *accounts) list() []account {
 	}
 	for i := range found {
 		found[i].Email = a.email(found[i])
+		found[i].Who = found[i].Email
 		found[i].AuthEnds, _ = a.authInfoFrom(found[i], sources[i])
+		found[i].Plan = subscription(sources[i])
 	}
-	a.mu.Lock()
-	a.discovered, a.discoveredAt = found, a.now()
-	a.mu.Unlock()
-	return append([]account(nil), found...)
+	return found
 }
 
-func (a *accounts) email(acc account) string {
+func (a *claudeAccounts) email(acc account) string {
 	path := filepath.Join(acc.Path, ".claude.json")
 	if acc.Dir == "" {
 		path = filepath.Join(a.home, ".claude.json")
@@ -243,7 +235,7 @@ func keychainQueries(configDir string) [][]string {
 
 // credentialSources are the credential documents Claude Code may hold for a login: its Keychain
 // item and its file. Either can be the stale leftover of an older sign-in, so every one is read.
-func (a *accounts) credentialSources(configDir, path string) [][]byte {
+func (a *claudeAccounts) credentialSources(configDir, path string) [][]byte {
 	var sources [][]byte
 	if a.credentials == credentialsKeychain {
 		// Claude Code files its item under the user's name; other items with the same service
@@ -263,7 +255,7 @@ func (a *accounts) credentialSources(configDir, path string) [][]byte {
 }
 
 // token is a live access token, refreshed through Claude Code when every one has expired.
-func (a *accounts) token(acc account) string {
+func (a *claudeAccounts) token(acc account) string {
 	if live := a.readToken(acc); live != "" {
 		return live
 	}
@@ -273,7 +265,7 @@ func (a *accounts) token(acc account) string {
 
 // readToken is the account's unexpired long-lived token when it has one (see longtoken.go), else
 // the access token that has not expired and lasts longest, across the login's sources.
-func (a *accounts) readToken(acc account) string {
+func (a *claudeAccounts) readToken(acc account) string {
 	if long, ok := a.readLongToken(acc); ok && long.valid(a.now()) {
 		return long.Token
 	}
@@ -303,6 +295,8 @@ type login struct {
 	ExpiresAt   *float64 `json:"expiresAt"`
 	// RefreshTokenExpiresAt is the sign-in's hard end (epoch ms); refreshing does not move it.
 	RefreshTokenExpiresAt *float64 `json:"refreshTokenExpiresAt"`
+	// SubscriptionType is the plan the sign-in is on ("pro", "max", "team").
+	SubscriptionType string `json:"subscriptionType"`
 }
 
 // parseLogin reads a credential document: Claude Code's `{"claudeAiOauth": {...}}` or a bare login.
@@ -320,6 +314,16 @@ func parseLogin(raw []byte) (login, bool) {
 	return doc.login, true
 }
 
+// subscription is the plan the first credential source that states one is on; empty when none does.
+func subscription(sources [][]byte) string {
+	for _, raw := range sources {
+		if l, ok := parseLogin(raw); ok && l.SubscriptionType != "" {
+			return l.SubscriptionType
+		}
+	}
+	return ""
+}
+
 // claudeEnv is the environment for running `claude` as the login in configDir (empty: the default
 // login), without this proxy or an injected token in the way.
 func claudeEnv(configDir string) []string {
@@ -335,7 +339,7 @@ func claudeEnv(configDir string) []string {
 	return env
 }
 
-func (a *accounts) refresh(acc account) {
+func (a *claudeAccounts) refresh(acc account) {
 	if a.claude == "" {
 		return
 	}
@@ -347,116 +351,61 @@ func (a *accounts) refresh(acc account) {
 	_ = cmd.Run()
 }
 
-// current is the client's active account, moving on from a spent one; nil when none is signed in
-// or all are spent.
-func (a *accounts) current(client string) *account {
-	list := a.list()
-	if len(list) == 0 {
-		return nil
+// The Claude provider (see pool.go for the interface).
+
+func (a *claudeAccounts) name() string { return "claude" }
+
+// serves is every path: Claude's upstream answers whatever no other provider serves.
+func (a *claudeAccounts) serves(string) bool { return true }
+
+func (a *claudeAccounts) spends(path string) bool { return isInference(path) }
+
+func (a *claudeAccounts) authorize(out *http.Request, acc account) bool {
+	token := a.token(acc)
+	if token == "" {
+		return false
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := a.now()
-	want := a.active[client]
-	for i := range list {
-		if list[i].ID == want && !a.spentUntil[want].After(now) {
-			return &list[i]
-		}
-	}
-	usable := nextAccount(list, want, a.spentUntil, now)
-	if usable != nil {
-		a.active[client] = usable.ID
-	}
-	return usable
+	out.Header.Del("X-Api-Key")
+	out.Header.Set("Authorization", "Bearer "+token)
+	return true
 }
 
-// spend records the account spent until `until` (an hour when zero) and returns the next usable one.
-func (a *accounts) spend(client, id string, until time.Time) *account {
-	list := a.list()
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := a.now()
-	if until.After(now) {
-		a.spentUntil[id] = until
-	} else {
-		a.spentUntil[id] = now.Add(fallbackExhaustion)
-	}
-	usable := nextAccount(list, id, a.spentUntil, now)
-	next := "none (Claude's own login answers)"
-	if usable != nil {
-		a.active[client] = usable.ID
-		next = usable.ID
-	}
-	log.Printf("account %s spent until %s for client %s; now %s", id, a.spentUntil[id].Format(time.RFC3339), client, next)
-	return usable
+func (a *claudeAccounts) spent(status int, h http.Header, _ []byte) (bool, time.Time) {
+	return spentReset(status, h)
 }
 
-type accountStatus struct {
-	ID         string   `json:"id"`
-	Email      string   `json:"email,omitempty"`
-	SpentUntil *int64   `json:"spentUntil"`
-	ActiveFor  []string `json:"activeFor"`
-	// AuthEnds is when the account's auth ends (unix seconds); null when unknown.
-	AuthEnds *int64 `json:"authEnds"`
-	// Usage is the latest usage headers seen for the account (see usage_record.go), by name.
-	Usage map[string]usageValue `json:"usage,omitempty"`
+func (a *claudeAccounts) observe(acc account, h http.Header) time.Time {
+	a.recordUsage(acc, h)
+	return time.Time{}
 }
 
-func (a *accounts) status() []accountStatus {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := a.now()
+// unauthorized: the account's token is dead (revoked, or its auth ended). Claude must not see that
+// as its own login failing, so the account is skipped for a while, like a spent one.
+func (a *claudeAccounts) unauthorized(acc account) (retry, handBack bool) {
+	log.Printf("account %s auth rejected (401); run \"limitbreak renew %s\"", acc.ID, acc.ID)
+	return false, false
+}
+
+// usage is the stored usage headers and the windows they describe.
+func (a *claudeAccounts) usage(acc account) (map[string]usageValue, []usageWindow) {
 	records, err := readUsage(a.home)
 	if err != nil {
 		log.Printf("usage record read: %v", err)
 	}
-	out := []accountStatus{}
-	for _, acc := range a.discovered {
-		s := accountStatus{ID: acc.ID, Email: acc.Email, ActiveFor: []string{}}
-		if until := a.spentUntil[acc.ID]; until.After(now) {
-			unix := until.Unix()
-			s.SpentUntil = &unix
-		}
-		if !acc.AuthEnds.IsZero() {
-			unix := acc.AuthEnds.Unix()
-			s.AuthEnds = &unix
-		}
-		s.Usage = usageFor(records, acc)
-		for client, id := range a.active {
-			if id == acc.ID {
-				s.ActiveFor = append(s.ActiveFor, client)
-			}
-		}
-		sort.Strings(s.ActiveFor)
-		out = append(out, s)
-	}
-	return out
-}
-
-// setActive makes id the client's active account; false when no account has that id.
-func (a *accounts) setActive(client, id string) bool {
-	for _, acc := range a.list() {
-		if acc.ID == id {
-			a.mu.Lock()
-			a.active[client] = id
-			a.mu.Unlock()
-			log.Printf("client %s set to account %s", client, id)
-			return true
-		}
-	}
-	return false
+	values := usageFor(records, acc)
+	return values, claudeWindows(values)
 }
 
 // MARK: Proxy
 
 type proxy struct {
-	accounts *accounts
-	upstream string
-	client   *http.Client
+	// pools are the providers' accounts; the first one answers every path no other one serves.
+	pools  []*pool
+	client *http.Client
 }
 
-func newProxy(a *accounts, upstream string) *proxy {
-	return &proxy{accounts: a, upstream: strings.TrimRight(upstream, "/"),
+func newProxy(pools ...*pool) *proxy {
+	return &proxy{pools: pools,
 		client: &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 }
 
@@ -466,11 +415,28 @@ func apiError(w http.ResponseWriter, status int, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "api_error", "message": message}})
 }
 
+// poolFor is the pool whose provider serves path; the first pool when no other one does.
+func (p *proxy) poolFor(path string) *pool {
+	for _, pl := range p.pools[1:] {
+		if pl.provider.serves(path) {
+			return pl
+		}
+	}
+	return p.pools[0]
+}
+
+func (p *proxy) status() []accountStatus {
+	out := []accountStatus{}
+	for _, pl := range p.pools {
+		out = append(out, pl.status()...)
+	}
+	return out
+}
+
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/_status" {
-		p.accounts.list()
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(p.accounts.status())
+		_ = json.NewEncoder(w).Encode(p.status())
 		return
 	}
 	clientName, path, ok := route(r.URL.RequestURI())
@@ -482,76 +448,97 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.serveActive(w, r, clientName)
 		return
 	}
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		// Requests are put on accounts one by one, which a socket cannot be; Codex falls back to
+		// HTTP with streamed events when told so.
+		apiError(w, http.StatusUpgradeRequired, "websocket is not supported here; use HTTP")
+		return
+	}
+	pl := p.poolFor(path)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		apiError(w, http.StatusBadRequest, "bad request")
 		return
 	}
-	if !isInference(path) {
-		p.passThrough(w, r, path, body)
+	if !pl.provider.spends(path) {
+		p.passThrough(w, r, pl.upstream+path, body)
 		return
 	}
-	for range len(p.accounts.list()) + 1 {
-		acc := p.accounts.current(clientName)
+	renewed := map[string]bool{}
+	for attempts := len(pl.list()) + 1; attempts > 0; attempts-- {
+		acc := pl.current(clientName)
 		if acc == nil {
-			// Nothing to switch to (no login, or every account spent): Claude's own login answers.
-			p.passThrough(w, r, path, body)
+			// Nothing to switch to (no login, or every account spent): the client's own login answers.
+			p.passThrough(w, r, pl.upstream+path, body)
 			return
 		}
-		token := p.accounts.token(*acc)
-		if token == "" {
-			// A login that cannot give a token is skipped for a while, like a spent one.
-			if p.accounts.spend(clientName, acc.ID, p.accounts.now().Add(unavailableBackoff)) != nil {
-				continue
-			}
-			p.passThrough(w, r, path, body)
-			return
-		}
-		out, err := http.NewRequestWithContext(r.Context(), r.Method, p.upstream+path, bytes.NewReader(body))
+		out, err := upstreamRequest(r, pl.upstream+path, body)
 		if err != nil {
 			apiError(w, http.StatusBadRequest, "bad path")
 			return
 		}
-		for key, values := range r.Header {
-			if !hopHeaders[http.CanonicalHeaderKey(key)] {
-				out.Header[key] = values
+		if !pl.provider.authorize(out, *acc) {
+			// A login that cannot give a token is skipped for a while, like a spent one.
+			if pl.spend(clientName, acc.ID, pl.now().Add(unavailableBackoff)) != nil {
+				continue
 			}
+			p.passThrough(w, r, pl.upstream+path, body)
+			return
 		}
-		out.Header.Set("Authorization", "Bearer "+token)
-		out.Header.Set("Accept-Encoding", "identity")
 		resp, err := p.client.Do(out)
 		if err != nil {
 			apiError(w, http.StatusBadGateway, "upstream unreachable")
 			return
 		}
-		p.accounts.recordUsage(*acc, resp.Header)
+		spentAhead := pl.provider.observe(*acc, resp.Header)
 		if resp.StatusCode == http.StatusUnauthorized {
-			// The account's token is dead (revoked, or its auth ended). Claude must not see that
-			// as its own login failing, so the account is skipped for a while, like a spent one.
-			log.Printf("account %s auth rejected (401); run \"limitbreak renew %s\"", acc.ID, acc.ID)
-			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			if p.accounts.spend(clientName, acc.ID, p.accounts.now().Add(unavailableBackoff)) != nil {
-				continue
-			}
-			p.passThrough(w, r, path, body)
-			return
-		}
-		if spent, reset := spentReset(resp.StatusCode, resp.Header); spent {
-			if p.accounts.spend(clientName, acc.ID, reset) != nil {
+			retry, handBack := pl.provider.unauthorized(*acc)
+			if !handBack {
 				_, _ = io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
-				continue
+				if retry && !renewed[acc.ID] {
+					renewed[acc.ID] = true
+					attempts++
+					continue
+				}
+				if pl.spend(clientName, acc.ID, pl.now().Add(unavailableBackoff)) != nil {
+					continue
+				}
+				p.passThrough(w, r, pl.upstream+path, body)
+				return
+			}
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			// The reason a 429 is a spent window may be in its body; it is short, so it is read
+			// here and put back in front of the rest for the client.
+			peek, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+			resp.Body = struct {
+				io.Reader
+				io.Closer
+			}{io.MultiReader(bytes.NewReader(peek), resp.Body), resp.Body}
+			if spent, reset := pl.provider.spent(resp.StatusCode, resp.Header, peek); spent {
+				if pl.spend(clientName, acc.ID, reset) != nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					resp.Body.Close()
+					continue
+				}
+				spentAhead = time.Time{}
 			}
 		}
 		relay(w, resp)
+		if !spentAhead.IsZero() {
+			// This reply got through, but it says a window is now used up: the next request goes
+			// to the next account rather than waiting to be refused.
+			pl.spend(clientName, acc.ID, spentAhead)
+		}
 		return
 	}
-	p.passThrough(w, r, path, body)
+	p.passThrough(w, r, pl.upstream+path, body)
 }
 
-// serveActive answers `PUT /_c/<client>/_active` with `{"id":"<account id>"}`: the client's active
-// account becomes that one (it still moves on when that account is spent). 404 for an unknown id.
+// serveActive answers `PUT /_c/<client>/_active` with `{"provider":"codex","id":"<account id>"}`
+// (provider defaults to the first pool's, "claude"): the client's active account for that provider
+// becomes that one (it still moves on when that account is spent). 404 for an unknown provider or id.
 func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client string) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", http.MethodPut)
@@ -559,21 +546,35 @@ func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client strin
 		return
 	}
 	var body struct {
-		ID string `json:"id"`
+		Provider string `json:"provider"`
+		ID       string `json:"id"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.ID == "" {
-		apiError(w, http.StatusBadRequest, `body must be {"id":"<account id>"}`)
+		apiError(w, http.StatusBadRequest, `body must be {"provider":"<claude|codex>","id":"<account id>"}`)
 		return
 	}
-	if !p.accounts.setActive(client, body.ID) {
+	if body.Provider == "" {
+		body.Provider = p.pools[0].provider.name()
+	}
+	var pl *pool
+	for _, candidate := range p.pools {
+		if candidate.provider.name() == body.Provider {
+			pl = candidate
+		}
+	}
+	if pl == nil {
+		apiError(w, http.StatusNotFound, "no provider "+body.Provider)
+		return
+	}
+	if !pl.setActive(client, body.ID) {
 		apiError(w, http.StatusNotFound, "no account "+body.ID)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(p.accounts.status())
+	_ = json.NewEncoder(w).Encode(p.status())
 }
 
-// A proxy that cannot place a request on an account sends it on as Claude Code made it: it is
+// A proxy that cannot place a request on an account sends it on as the client made it: it is
 // never worse than no proxy.
 
 // isInference is a request that spends an account's usage: the messages API. Everything else
@@ -582,21 +583,32 @@ func isInference(path string) bool {
 	return strings.HasPrefix(path, "/v1/messages")
 }
 
-// passThrough sends the request upstream exactly as Claude Code made it, with its own credentials.
-func (p *proxy) passThrough(w http.ResponseWriter, r *http.Request, path string, body []byte) {
-	out, err := http.NewRequestWithContext(r.Context(), r.Method, p.upstream+path, bytes.NewReader(body))
+// upstreamRequest is the client's request addressed to target, with its own headers (its
+// credentials included) less those that belong to one connection. The reply is asked for
+// unencoded, so it can be relayed as it streams.
+func upstreamRequest(r *http.Request, target string, body []byte) (*http.Request, error) {
+	out, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
 	if err != nil {
-		apiError(w, http.StatusBadRequest, "bad path")
-		return
+		return nil, err
 	}
 	for key, values := range r.Header {
 		switch http.CanonicalHeaderKey(key) {
-		case "Host", "Content-Length", "Connection", "Accept-Encoding", "Transfer-Encoding", "Proxy-Connection", "Keep-Alive":
+		case "Host", "Content-Length", "Connection", "Accept-Encoding", "Transfer-Encoding", "Proxy-Connection", "Keep-Alive", "Expect":
 			continue
 		}
 		out.Header[key] = values
 	}
 	out.Header.Set("Accept-Encoding", "identity")
+	return out, nil
+}
+
+// passThrough sends the request upstream exactly as the client made it, with its own credentials.
+func (p *proxy) passThrough(w http.ResponseWriter, r *http.Request, target string, body []byte) {
+	out, err := upstreamRequest(r, target, body)
+	if err != nil {
+		apiError(w, http.StatusBadRequest, "bad path")
+		return
+	}
 	resp, err := p.client.Do(out)
 	if err != nil {
 		apiError(w, http.StatusBadGateway, "upstream unreachable")
@@ -649,8 +661,9 @@ func serve(args []string) {
 	flags := flag.NewFlagSet("serve", flag.ExitOnError)
 	port := flags.Int("port", envInt("LIMITBREAK_PORT", defaultPort), "port to listen on (loopback only)")
 	upstream := flags.String("upstream", envString("LIMITBREAK_UPSTREAM", defaultUpstream), "Anthropic API address")
+	codexUpstream := flags.String("codex-upstream", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream), "ChatGPT backend address for Codex")
 	home, _ := os.UserHomeDir()
-	homeFlag := flags.String("home", home, "home dir holding the Claude logins")
+	homeFlag := flags.String("home", home, "home dir holding the Claude and Codex logins")
 	credentials := flags.String("credentials", "auto", "auto, keychain or file")
 	_ = flags.Parse(args)
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", *port))
@@ -658,9 +671,10 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	log.Printf("limitbreak listening on http://%s", listener.Addr())
-	a := newAccounts(*homeFlag, *credentials, "")
+	a := newClaudeAccounts(*homeFlag, *credentials, "")
 	go newAuthWatch(a, notifyDesktop).run()
-	log.Fatal(http.Serve(listener, newProxy(a, *upstream)))
+	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
+	log.Fatal(http.Serve(listener, newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream))))
 }
 
 func envString(name, fallback string) string {

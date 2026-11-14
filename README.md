@@ -31,6 +31,8 @@ limitbreak add                       # sign in another account (browser), repeat
 
 Open a new terminal and run `claude` as usual. When one account's limit is hit, the next one answers.
 
+It does the same for Codex on ChatGPT sign-ins, see [Codex](#codex).
+
 ## What it does and does not touch
 
 - Only `/v1/messages*` requests are sent on an account's token. Everything else (claude.ai connectors, MCP, artifacts, profile) goes through untouched with Claude Code's own credentials, so those keep working.
@@ -63,7 +65,7 @@ That defines a `claude` function that points Claude Code at the proxy when it is
 ```sh
 limitbreak add            # signs in a new account in your browser, names it account-N
 limitbreak add work       # or pick the name
-limitbreak list           # accounts, who they are, which one is active (*)
+limitbreak list           # accounts by provider, who they are, which one is active (*)
 limitbreak remove work    # sign it out and delete its login from this machine
 ```
 
@@ -89,16 +91,45 @@ To use the same tokens on another machine of yours, sign the same-named accounts
 
 `limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
 
+## Codex
+
+The same proxy rotates Codex between ChatGPT sign-ins. Point Codex at it:
+
+```sh
+codex -c openai_base_url="http://127.0.0.1:48617/backend-api/codex"
+# or in ~/.codex/config.toml: openai_base_url = "http://127.0.0.1:48617/backend-api/codex"
+```
+
+- Accounts are `~/.codex` (the default, Codex's own login) and every `~/.codex-<name>` whose `auth.json` is a ChatGPT sign-in. `limitbreak add --provider codex [name]` runs `codex login` into a new `~/.codex-<name>`; `limitbreak remove --provider codex <name>` deletes that dir.
+- On the default account a request keeps Codex's own credentials; limitbreak never refreshes or rewrites `~/.codex`. On another account it swaps `Authorization` and `chatgpt-account-id` for that login's. The body (zstd) and its encoding pass as they are; replies stream back as they arrive.
+- A `429` whose body says `usage_limit_reached` marks the account spent until its `resets_at` and the same request goes again on the next account. A reply whose `x-codex-…-used-percent` header reaches 100 marks it spent ahead, so the next request goes elsewhere without being refused first. Any other `429` goes back to Codex unchanged.
+- A named login is refreshed by Codex itself, never by limitbreak calling the sign-in server: a day before its access token ends, or after a `401`, limitbreak runs `CODEX_HOME=<dir> codex app-server` and asks it for the account with `refreshToken`. A `401` on the default account goes back to Codex, which refreshes its own login.
+- Codex first tries a WebSocket; the proxy answers `426` and Codex carries on over HTTP (it logs one `failed to connect to Responses WebSocket` line per session).
+- Usage per account comes from `GET /backend-api/wham/usage`, which spends nothing, at most once every 5 minutes, and from the `x-codex-*` headers of each reply.
+- Replaying a turn on another ChatGPT account has not been tried yet with two subscriptions; encrypted reasoning from one account may not be readable by another.
+
 ## Options
 
-`limitbreak serve --port 48617 --upstream https://api.anthropic.com --home ~ --credentials auto|keychain|file`
+`limitbreak serve --port 48617 --upstream https://api.anthropic.com --codex-upstream https://chatgpt.com --home ~ --credentials auto|keychain|file`
 
-A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding.
+A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding. `/backend-api/…` paths are Codex's, everything else Claude's.
 
 Loopback API for apps that show accounts (JSON; fields are only ever added):
 
-- `GET /_status`: every account with `id`, `email`, `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null) and `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). No token is ever in it.
-- `PUT /_c/<client>/_active` with `{"id":"work"}`: that client's next request goes to `work` (it still moves on when `work` is spent). `404` for an unknown id. Replies with the status list.
+- `GET /_status`: every account with `id`, `provider` (`claude` or `codex`), `email`, `label` (the name to show: the email, else the id), `plan` (`max`, `plus`, … or empty), `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null), `windows` and, for Claude, `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). `windows` is the same for every provider: `[{"id":"five_hour","label":"5h","usedPercent":42,"resetsAt":1800000000,"windowMinutes":300,"observed":1799990000}]` (Codex: `primary`, `secondary`; times in unix seconds, `resetsAt` may be null). No token is ever in it.
+- `PUT /_c/<client>/_active` with `{"provider":"codex","id":"work"}` (`provider` defaults to `claude`): that client's next request for that provider goes to `work` (it still moves on when `work` is spent). The active account is per client per provider. `404` for an unknown provider or id. Replies with the status list.
+
+For apps, `add` and `remove` speak JSON, one event per line on stdout:
+
+```sh
+limitbreak add --provider codex work --json
+{"event":"open_url","url":"https://auth.openai.com/oauth/authorize?…"}
+{"event":"added","provider":"codex","id":"work","email":"me@example.com"}
+limitbreak remove --provider codex work --yes --json
+{"event":"removed","provider":"codex","id":"work","email":"me@example.com"}
+```
+
+`open_url` is the sign-in page (the sign-in may have opened it already); `device_code` (`code`) is a code to type on that page; `need_code` asks for a pasted code, which `add` then reads as one line from stdin; `added` may carry `sameAs` when the new login is the same subscription as another account; `error` (`message`) ends a failed run, which exits 1. Without `--json` and `--provider` both commands behave as before.
 
 ## Caveats, read these
 

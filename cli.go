@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,7 +27,10 @@ limitbreak share <ssh-host>     copy the 1-year tokens to the same-named account
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak video                watch a switch happen as an arcade battle (simulated, no real login touched)
 
-The default account is the one plain "claude auth login" signs in.`
+add and remove take --provider claude|codex (default claude) and --json (one JSON event per
+line, for apps; remove --json needs --yes).
+
+The default account is the one plain "claude auth login" signs in (for Codex, "codex login").`
 
 var accountName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
@@ -36,29 +40,23 @@ func runCommand(command string, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	a := newAccounts(home, "auto", "")
+	a := newClaudeAccounts(home, "auto", "")
 	switch command {
 	case "serve":
 		serve(args)
 		return 0
-	case "add":
-		name := ""
-		if len(args) > 0 {
-			name = args[0]
-		}
-		err = addAccount(a, name, loginAs(a), os.Stdout)
+	case "add", "remove":
+		err = accountCommand(command, args, a, newCodexAccounts(home, "", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream)))
 	case "video":
 		err = runVideo(os.Stdout)
 	case "list":
-		listAccounts(a, os.Stdout)
+		listAccounts([]loginProvider{a, newCodexAccounts(home, "", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream))}, os.Stdout)
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
 	case "share":
 		err = shareTokens(a, args, sshImport, os.Stdout)
 	case "import-token":
 		err = importToken(a, args, countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdin, os.Stdout)
-	case "remove":
-		err = removeAccount(a, args, os.Stdin, os.Stdout)
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		return 2
@@ -70,13 +68,149 @@ func runCommand(command string, args []string) int {
 	return 0
 }
 
-// freshAccounts is the account list read now, not the cached one.
-func freshAccounts(a *accounts) []account {
-	a.mu.Lock()
-	a.discovered = nil
-	a.mu.Unlock()
-	return a.list()
+// accountCommand runs add or remove for the provider named by --provider (claude by default),
+// printing JSON events with --json.
+func accountCommand(command string, args []string, providers ...loginProvider) error {
+	providerName, asJSON, rest, err := accountFlags(args)
+	var lp loginProvider
+	for _, p := range providers {
+		if p.name() == providerName {
+			lp = p
+		}
+	}
+	if err == nil && lp == nil {
+		err = fmt.Errorf("unknown provider %q; use claude or codex", providerName)
+	}
+	if err != nil {
+		if asJSON {
+			newEvents(os.Stdout)(loginEvent{Event: "error", Message: err.Error()})
+		}
+		return err
+	}
+	name := ""
+	if len(rest) > 0 {
+		name = rest[0]
+	}
+	switch {
+	case command == "add" && asJSON:
+		return addAccountJSON(lp, name, commandRunner(lp.loginCommand), os.Stdin, os.Stdout)
+	case command == "add":
+		return addAccount(lp, name, loginAs(lp), os.Stdout)
+	case asJSON:
+		return removeAccountJSON(lp, rest, os.Stdout)
+	}
+	return removeAccount(lp, rest, os.Stdin, os.Stdout)
 }
+
+// accountFlags takes --provider <p> (or --provider=<p>) and --json out of args.
+func accountFlags(args []string) (provider string, asJSON bool, rest []string, err error) {
+	provider = "claude"
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--json":
+			asJSON = true
+		case arg == "--provider":
+			if i+1 >= len(args) {
+				return provider, asJSON, rest, fmt.Errorf("--provider needs a value: claude or codex")
+			}
+			i++
+			provider = args[i]
+		case strings.HasPrefix(arg, "--provider="):
+			provider = strings.TrimPrefix(arg, "--provider=")
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return provider, asJSON, rest, nil
+}
+
+// MARK: Providers the CLI signs in
+
+// A loginProvider is a provider whose named logins the CLI adds and removes with the provider's
+// own sign-in.
+type loginProvider interface {
+	provider
+	// cliNames are how the provider's own app and commands are called, for messages.
+	cliNames() cliNames
+	// dirFor is where the named login lives.
+	dirFor(name string) string
+	// loginCommand is the provider's own sign-in into dir.
+	loginCommand(dir string) (*exec.Cmd, error)
+	// forget deletes a named login from this machine.
+	forget(acc account) error
+}
+
+type cliNames struct{ app, login, logout string }
+
+func (a *claudeAccounts) cliNames() cliNames {
+	return cliNames{app: "Claude Code", login: "claude auth login", logout: "claude auth logout"}
+}
+
+func (a *claudeAccounts) dirFor(name string) string { return filepath.Join(a.home, ".claude-"+name) }
+
+func (a *claudeAccounts) loginCommand(dir string) (*exec.Cmd, error) {
+	if a.claude == "" {
+		return nil, fmt.Errorf("claude is not on PATH; install Claude Code first")
+	}
+	cmd := exec.Command(a.claude, "auth", "login", "--claudeai")
+	cmd.Env = claudeEnv(dir)
+	return cmd, nil
+}
+
+// forget deletes a Claude login: its Keychain items on macOS, its 1-year token and its config dir.
+func (a *claudeAccounts) forget(acc account) error {
+	if runtime.GOOS == "darwin" {
+		for _, query := range keychainQueries(acc.Dir) {
+			args := append([]string{"delete-generic-password"}, query[1:len(query)-1]...)
+			_ = exec.Command("security", args...).Run()
+		}
+	}
+	if err := a.deleteLongToken(acc); err != nil {
+		return err
+	}
+	return os.RemoveAll(acc.Dir)
+}
+
+func (a *codexAccounts) cliNames() cliNames {
+	return cliNames{app: "Codex", login: "codex login", logout: "codex logout"}
+}
+
+func (a *codexAccounts) dirFor(name string) string { return filepath.Join(a.home, ".codex-"+name) }
+
+func (a *codexAccounts) loginCommand(dir string) (*exec.Cmd, error) {
+	if a.codex == "" {
+		return nil, fmt.Errorf("codex is not on PATH; install Codex first")
+	}
+	cmd := exec.Command(a.codex, "login")
+	cmd.Env, cmd.Dir = codexEnv(dir), dir
+	return cmd, nil
+}
+
+// forget deletes a Codex login. A home dir Limit Break made goes whole; one it found (a
+// ~/.codex-<name> another tool also keeps logs or sessions in) loses only its auth.json.
+func (a *codexAccounts) forget(acc account) error {
+	if _, err := os.Stat(filepath.Join(acc.Dir, createdMarker)); err == nil {
+		return os.RemoveAll(acc.Dir)
+	}
+	if err := os.Remove(filepath.Join(acc.Dir, "auth.json")); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// createdMarker marks a login dir Limit Break made itself, so remove may delete all of it.
+const createdMarker = ".limitbreak-created"
+
+func isAccount(list []account, id string) bool {
+	for _, acc := range list {
+		if acc.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// MARK: Add and remove
 
 // nextFreeName is account-N for the first N not taken.
 func nextFreeName(taken []account) string {
@@ -91,47 +225,59 @@ func nextFreeName(taken []account) string {
 	}
 }
 
-// loginAs runs Claude Code's own browser sign-in into the config dir, with the terminal attached.
-func loginAs(a *accounts) func(dir string) error {
+// loginAs runs the provider's own browser sign-in into the dir, with the terminal attached.
+func loginAs(a loginProvider) func(dir string) error {
 	return func(dir string) error {
-		if a.claude == "" {
-			return fmt.Errorf("claude is not on PATH; install Claude Code first")
+		cmd, err := a.loginCommand(dir)
+		if err != nil {
+			return err
 		}
-		cmd := exec.Command(a.claude, "auth", "login", "--claudeai")
-		cmd.Env = claudeEnv(dir)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return cmd.Run()
 	}
 }
 
-// addAccount signs a new login into ~/.claude-<name> (account-N when no name is given) and
-// reports who it is. login is injected so the flow is testable without a browser.
-func addAccount(a *accounts, name string, login func(dir string) error, out io.Writer) error {
-	existing := freshAccounts(a)
+// prepareAdd picks and checks the new login's name (account-N when none is given) and makes its dir.
+func prepareAdd(a loginProvider, name string) (string, string, bool, error) {
 	if name == "" {
-		name = nextFreeName(existing)
+		name = nextFreeName(a.list())
 	}
 	if name == defaultID {
-		return fmt.Errorf(`"default" is the account plain "claude auth login" signs in; pick another name`)
+		return "", "", false, fmt.Errorf(`"default" is the account plain "%s" signs in; pick another name`, a.cliNames().login)
 	}
 	if !accountName.MatchString(name) {
-		return fmt.Errorf("name %q: use letters, digits, - and _", name)
+		return "", "", false, fmt.Errorf("name %q: use letters, digits, - and _", name)
 	}
-	dir := filepath.Join(a.home, ".claude-"+name)
+	dir := a.dirFor(name)
 	_, statErr := os.Stat(dir)
 	created := os.IsNotExist(statErr)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "Signing in %q. Finish the sign-in in your browser...\n", name)
-	if err := login(dir); err != nil {
-		if created {
-			_ = os.Remove(dir)
+	if !created && !isAccount(a.list(), name) {
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
+			// Another tool's dir with the same name (say ~/.codex-chief): never sign into it,
+			// or a later remove would delete what it keeps there.
+			return "", "", false, fmt.Errorf("%s already exists and is not a login here; pick another name", dir)
 		}
-		return fmt.Errorf("sign-in failed: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", false, err
+	}
+	if created {
+		_ = os.WriteFile(filepath.Join(dir, createdMarker), nil, 0o600)
+	}
+	return name, dir, created, nil
+}
+
+// finishAdd checks the sign-in landed and returns the new account, every account now, and the
+// others that are the same subscription. A dir it created is removed when nothing was added.
+func finishAdd(a loginProvider, name, dir string, created bool, loginErr error) (account, []account, []account, error) {
+	if loginErr != nil {
+		if created {
+			_ = os.RemoveAll(dir)
+		}
+		return account{}, nil, nil, fmt.Errorf("sign-in failed: %w", loginErr)
 	}
 	var added *account
-	list := freshAccounts(a)
+	list := a.list()
 	for i := range list {
 		if list[i].ID == name {
 			added = &list[i]
@@ -139,79 +285,138 @@ func addAccount(a *accounts, name string, login func(dir string) error, out io.W
 	}
 	if added == nil {
 		if created {
-			_ = os.Remove(dir)
+			_ = os.RemoveAll(dir)
 		}
-		return fmt.Errorf("no login found after sign-in; nothing was added")
+		return account{}, nil, nil, fmt.Errorf("no login found after sign-in; nothing was added")
+	}
+	var same []account
+	for _, other := range list {
+		if other.ID != name && added.Who != "" && other.Who == added.Who {
+			same = append(same, other)
+		}
+	}
+	return *added, list, same, nil
+}
+
+// addAccount signs a new login into the provider's dir for name and reports who it is. login is
+// injected so the flow is testable without a browser.
+func addAccount(a loginProvider, name string, login func(dir string) error, out io.Writer) error {
+	name, dir, created, err := prepareAdd(a, name)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Signing in %q. Finish the sign-in in your browser...\n", name)
+	added, list, same, err := finishAdd(a, name, dir, created, login(dir))
+	if err != nil {
+		return err
 	}
 	who := added.Email
 	if who == "" {
 		who = "signed in"
 	}
 	fmt.Fprintf(out, "Added %s (%s). %d accounts now.\n", name, who, len(list))
-	for _, other := range list {
-		if other.ID != name && added.Email != "" && other.Email == added.Email {
-			fmt.Fprintf(out, "Warning: %s is the same login as %q; two entries for one account do not add capacity. `limitbreak remove %s` drops it.\n", added.Email, other.ID, name)
-		}
+	for _, other := range same {
+		fmt.Fprintf(out, "Warning: %s is the same login as %q; two entries for one account do not add capacity. `limitbreak remove %s` drops it.\n", added.Email, other.ID, name)
 	}
 	return nil
 }
 
-func listAccounts(a *accounts, out io.Writer) {
-	list := freshAccounts(a)
-	if len(list) == 0 {
+func listAccounts(providers []loginProvider, out io.Writer) {
+	active := activeAccounts()
+	found := false
+	for _, p := range providers {
+		for _, acc := range p.list() {
+			found = true
+			mark := " "
+			if acc.ID == active[p.name()] {
+				mark = "*"
+			}
+			email := acc.Email
+			if email == "" {
+				email = "(email unknown)"
+			}
+			if acc.Plan != "" {
+				email += " (" + acc.Plan + ")"
+			}
+			fmt.Fprintf(out, "%s %-6s %-16s %s\n", mark, p.name(), acc.ID, email)
+			switch a := p.(type) {
+			case *claudeAccounts:
+				end, kind := a.authInfo(acc)
+				fmt.Fprintf(out, "    auth: %s\n", authLine(acc.ID, end, kind, a.now()))
+				showUsage(out, a.home, acc)
+			case *codexAccounts:
+				if acc.Dir == "" {
+					fmt.Fprintf(out, "    auth: Codex's own login, refreshed by Codex\n")
+				} else {
+					fmt.Fprintf(out, "    auth: refreshed by limitbreak through codex app-server\n")
+				}
+				_, windows := a.usage(acc)
+				showWindows(out, windows)
+			}
+		}
+	}
+	if !found {
 		fmt.Fprintln(out, "No accounts signed in. Run `claude auth login` (default) or `limitbreak add`.")
 		return
 	}
-	active := activeAccount()
-	for _, acc := range list {
-		mark := " "
-		if acc.ID == active {
-			mark = "*"
-		}
-		email := acc.Email
-		if email == "" {
-			email = "(email unknown)"
-		}
-		fmt.Fprintf(out, "%s %-16s %s\n", mark, acc.ID, email)
-		end, kind := a.authInfo(acc)
-		fmt.Fprintf(out, "    auth: %s\n", authLine(acc.ID, end, kind, a.now()))
-		showUsage(out, a.home, acc)
-	}
-	if active == "" {
+	if len(active) == 0 {
 		fmt.Fprintln(out, "(proxy not running: start it with the installed service, or `limitbreak`)")
 	}
 }
 
-// activeAccount asks the running proxy which account the shared client is on; empty when it is down.
-func activeAccount() string {
+// activeAccounts asks the running proxy which account the shared client is on, by provider;
+// empty when it is down.
+func activeAccounts() map[string]string {
 	resp, err := (&http.Client{Timeout: time.Second}).Get(fmt.Sprintf("http://127.0.0.1:%d/_status", envInt("LIMITBREAK_PORT", defaultPort)))
 	if err != nil {
-		return ""
+		return map[string]string{}
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	return activeFromStatus(raw)
 }
 
-func activeFromStatus(raw []byte) string {
+// activeFromStatus is the shared client's account per provider in a `GET /_status` reply; a row
+// without a provider is Claude's.
+func activeFromStatus(raw []byte) map[string]string {
+	active := map[string]string{}
 	var rows []accountStatus
 	if json.Unmarshal(raw, &rows) != nil {
-		return ""
+		return active
 	}
 	for _, r := range rows {
 		for _, c := range r.ActiveFor {
 			if c == sharedClient {
-				return r.ID
+				provider := r.Provider
+				if provider == "" {
+					provider = "claude"
+				}
+				active[provider] = r.ID
 			}
 		}
 	}
-	return ""
+	return active
 }
 
-// removeAccount deletes a non-default login: its config dir and, on macOS, its Keychain item.
-func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) error {
-	yes := false
-	name := ""
+// namedLogin is the account a remove names: never the default one, which belongs to the provider.
+func namedLogin(a loginProvider, name string) (account, error) {
+	if name == "" {
+		return account{}, fmt.Errorf("usage: limitbreak remove <name> [-y]")
+	}
+	if name == defaultID {
+		n := a.cliNames()
+		return account{}, fmt.Errorf(`the default account is %s's own login; sign out with "%s"`, n.app, n.logout)
+	}
+	for _, acc := range a.list() {
+		if acc.ID == name {
+			return acc, nil
+		}
+	}
+	return account{}, fmt.Errorf("no account named %q", name)
+}
+
+// removeArgs is the name and whether -y/--yes was given.
+func removeArgs(args []string) (name string, yes bool) {
 	for _, arg := range args {
 		if arg == "-y" || arg == "--yes" {
 			yes = true
@@ -219,21 +424,15 @@ func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) erro
 			name = arg
 		}
 	}
-	if name == "" {
-		return fmt.Errorf("usage: limitbreak remove <name> [-y]")
-	}
-	if name == defaultID {
-		return fmt.Errorf(`the default account is Claude Code's own login; sign out with "claude auth logout"`)
-	}
-	var target *account
-	for _, acc := range freshAccounts(a) {
-		if acc.ID == name {
-			acc := acc
-			target = &acc
-		}
-	}
-	if target == nil {
-		return fmt.Errorf("no account named %q", name)
+	return name, yes
+}
+
+// removeAccount deletes a non-default login (see forget) after asking, unless -y.
+func removeAccount(a loginProvider, args []string, in io.Reader, out io.Writer) error {
+	name, yes := removeArgs(args)
+	target, err := namedLogin(a, name)
+	if err != nil {
+		return err
 	}
 	if !yes {
 		fmt.Fprintf(out, "Delete the login %q (%s) from this machine? [y/N] ", name, target.Email)
@@ -243,20 +442,193 @@ func removeAccount(a *accounts, args []string, in io.Reader, out io.Writer) erro
 			return nil
 		}
 	}
-	if runtime.GOOS == "darwin" {
-		for _, query := range keychainQueries(target.Dir) {
-			args := append([]string{"delete-generic-password"}, query[1:len(query)-1]...)
-			_ = exec.Command("security", args...).Run()
-		}
-	}
-	if err := a.deleteLongToken(*target); err != nil {
-		return err
-	}
-	if err := os.RemoveAll(target.Dir); err != nil {
+	if err := a.forget(target); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "Removed %s.\n", name)
 	return nil
+}
+
+// MARK: JSON events
+
+// loginEvent is one line of `add --json` / `remove --json` output.
+type loginEvent struct {
+	// Event is open_url, device_code, need_code, added, removed or error.
+	Event    string `json:"event"`
+	URL      string `json:"url,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Email    string `json:"email,omitempty"`
+	// SameAs names an account that is the same subscription as the one just added.
+	SameAs  string `json:"sameAs,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// newEvents writes events to out, one JSON object per line; safe from several goroutines.
+func newEvents(out io.Writer) func(loginEvent) {
+	var mu sync.Mutex
+	enc := json.NewEncoder(out)
+	return func(e loginEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		_ = enc.Encode(e)
+	}
+}
+
+// loginRunner runs a sign-in into dir with its terminal output going to output; each string on
+// codes is a line typed into it.
+type loginRunner func(dir string, output io.Writer, codes <-chan string) error
+
+// commandRunner runs the provider's sign-in command, feeding it the codes. Its output also goes to
+// stderr, for a person reading along.
+func commandRunner(command func(dir string) (*exec.Cmd, error)) loginRunner {
+	return func(dir string, output io.Writer, codes <-chan string) error {
+		cmd, err := command(dir)
+		if err != nil {
+			return err
+		}
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return err
+		}
+		cmd.Stdout = io.MultiWriter(output, os.Stderr)
+		cmd.Stderr = cmd.Stdout
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() {
+			for code := range codes {
+				_, _ = io.WriteString(stdin, code+"\n")
+			}
+		}()
+		return cmd.Wait()
+	}
+}
+
+// addAccountJSON is addAccount for apps: it reports the sign-in as events (see loginWatch) and
+// ends with added or error.
+func addAccountJSON(a loginProvider, name string, run loginRunner, in io.Reader, out io.Writer) error {
+	emit := newEvents(out)
+	fail := func(err error) error {
+		emit(loginEvent{Event: "error", Message: err.Error()})
+		return err
+	}
+	name, dir, created, err := prepareAdd(a, name)
+	if err != nil {
+		return fail(err)
+	}
+	codes := make(chan string, 1)
+	watch := &loginWatch{emit: emit, answers: bufio.NewReader(in), codes: codes}
+	loginErr := run(dir, watch, codes)
+	watch.flush()
+	added, _, same, err := finishAdd(a, name, dir, created, loginErr)
+	if err != nil {
+		return fail(err)
+	}
+	e := loginEvent{Event: "added", Provider: a.name(), ID: added.ID, Email: added.Email}
+	if len(same) > 0 {
+		e.SameAs = same[0].ID
+	}
+	emit(e)
+	return nil
+}
+
+// removeAccountJSON is removeAccount for apps: it needs --yes, and ends with removed or error.
+func removeAccountJSON(a loginProvider, args []string, out io.Writer) error {
+	emit := newEvents(out)
+	fail := func(err error) error {
+		emit(loginEvent{Event: "error", Message: err.Error()})
+		return err
+	}
+	name, yes := removeArgs(args)
+	if !yes {
+		return fail(fmt.Errorf("remove --json needs --yes"))
+	}
+	target, err := namedLogin(a, name)
+	if err != nil {
+		return fail(err)
+	}
+	if err := a.forget(target); err != nil {
+		return fail(err)
+	}
+	emit(loginEvent{Event: "removed", Provider: a.name(), ID: target.ID, Email: target.Email})
+	return nil
+}
+
+var (
+	signInURL  = regexp.MustCompile(`https?://[^\s"'<>]+`)
+	deviceCode = regexp.MustCompile(`\b[A-Z0-9]{4,}-[A-Z0-9]{4,}\b`)
+)
+
+// loginWatch reads a sign-in's terminal output and turns it into events: the first sign-in link
+// (not a localhost callback) as open_url; a one-time code to type on that page as device_code; a
+// prompt to paste a code back as need_code, after which one line read from answers goes to the
+// sign-in. Reading the answer never holds up the output, so a sign-in that finishes in the
+// browser is not kept waiting for one.
+type loginWatch struct {
+	emit    func(loginEvent)
+	answers *bufio.Reader
+	codes   chan<- string
+
+	line       []byte
+	opened     bool
+	asked      bool
+	wantDevice bool
+}
+
+func (w *loginWatch) Write(p []byte) (int, error) {
+	for _, b := range p {
+		if b == '\n' || b == '\r' {
+			w.flush()
+			continue
+		}
+		w.line = append(w.line, b)
+	}
+	// A prompt waits on its own line without ending it.
+	w.prompt(cleanTerminal(string(w.line)))
+	return len(p), nil
+}
+
+// flush handles the line so far as a whole line.
+func (w *loginWatch) flush() {
+	text := cleanTerminal(string(w.line))
+	w.line = w.line[:0]
+	for _, link := range signInURL.FindAllString(text, -1) {
+		if u, err := url.Parse(link); err == nil && u.Hostname() != "localhost" && u.Hostname() != "127.0.0.1" && !w.opened {
+			w.opened = true
+			w.emit(loginEvent{Event: "open_url", URL: link})
+		}
+	}
+	if strings.Contains(strings.ToLower(text), "one-time code") {
+		w.wantDevice = true
+	}
+	if code := deviceCode.FindString(text); w.wantDevice && code != "" {
+		w.wantDevice = false
+		w.emit(loginEvent{Event: "device_code", Code: code})
+	}
+	w.prompt(text)
+	w.asked = false
+}
+
+func (w *loginWatch) prompt(text string) {
+	lower := strings.ToLower(text)
+	if w.asked || !strings.Contains(lower, "paste") || !strings.Contains(lower, "code") {
+		return
+	}
+	w.asked = true
+	w.emit(loginEvent{Event: "need_code"})
+	go func() {
+		answer, err := w.answers.ReadString('\n')
+		if answer = strings.TrimSpace(answer); answer != "" || err == nil {
+			w.codes <- answer
+		}
+	}()
+}
+
+// cleanTerminal is text with terminal escapes and control characters taken out.
+func cleanTerminal(s string) string {
+	return controlChars.ReplaceAllString(terminalEscape.ReplaceAllString(s, ""), "")
 }
 
 // MARK: Renew
@@ -324,7 +696,7 @@ type tokenRunner func(acc account, typescript string) error
 // tokenValidator asks Anthropic about a token and returns the HTTP status.
 type tokenValidator func(token string) (int, error)
 
-func setupTokenRunner(a *accounts) tokenRunner {
+func setupTokenRunner(a *claudeAccounts) tokenRunner {
 	return func(acc account, typescript string) error {
 		if a.claude == "" {
 			return fmt.Errorf("claude is not on PATH; install Claude Code first")
@@ -367,7 +739,7 @@ func countTokensValidator(upstream string) tokenValidator {
 
 // renewAccounts gives accounts a 1-year token: named ones always, else every one that needs it
 // (needsRenew), or all of them with --all. One failing account does not stop the others.
-func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenValidator, out io.Writer) error {
+func renewAccounts(a *claudeAccounts, args []string, run tokenRunner, validate tokenValidator, out io.Writer) error {
 	all := false
 	var names []string
 	for _, arg := range args {
@@ -380,7 +752,7 @@ func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenVa
 			names = append(names, arg)
 		}
 	}
-	list := freshAccounts(a)
+	list := a.list()
 	var targets []account
 	failed := map[string]string{}
 	var failedOrder []string
@@ -441,7 +813,7 @@ func renewAccounts(a *accounts, args []string, run tokenRunner, validate tokenVa
 	return nil
 }
 
-func renewOne(a *accounts, acc account, run tokenRunner, validate tokenValidator, out io.Writer) error {
+func renewOne(a *claudeAccounts, acc account, run tokenRunner, validate tokenValidator, out io.Writer) error {
 	email, who := acc.Email, acc.Email
 	if email == "" {
 		email, who = "email unknown", "the account you want for "+acc.ID
@@ -544,7 +916,7 @@ func sshImport(host, id string, record []byte) (string, error) {
 }
 
 // shareTokens copies every account's unexpired 1-year token to the same-named account on host.
-func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) error {
+func shareTokens(a *claudeAccounts, args []string, send remoteImport, out io.Writer) error {
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return fmt.Errorf("usage: limitbreak share <ssh-host>")
 	}
@@ -552,7 +924,7 @@ func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) e
 	now := a.now()
 	var failed []string
 	shared := 0
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		t, ok := a.readLongToken(acc)
 		if !ok || !t.valid(now) {
 			fmt.Fprintf(out, "%s has no 1-year token; skipped (run limitbreak renew %s).\n", acc.ID, acc.ID)
@@ -581,7 +953,7 @@ func shareTokens(a *accounts, args []string, send remoteImport, out io.Writer) e
 
 // importToken stores a token record read from in for the named local account, after Anthropic
 // accepts it. The account must already exist here, so the proxy knows it.
-func importToken(a *accounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
+func importToken(a *claudeAccounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: limitbreak import-token <name> < record.json")
 	}
@@ -597,7 +969,7 @@ func importToken(a *accounts, args []string, validate tokenValidator, in io.Read
 		return fmt.Errorf("the token has expired")
 	}
 	var target *account
-	for _, acc := range freshAccounts(a) {
+	for _, acc := range a.list() {
 		if acc.ID == args[0] {
 			acc := acc
 			target = &acc
