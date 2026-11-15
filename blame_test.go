@@ -162,7 +162,7 @@ func TestBlameCommandPrintsATableAndJSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &rows); err != nil || len(rows) != 1 || rows[0].Key != "work" || rows[0].Requests != 2 {
 		t.Fatal(err, out.String())
 	}
-	if err := blameCommand(home, []string{"--by", "model"}, &out); err == nil {
+	if err := blameCommand(home, []string{"--by", "colour"}, &out); err == nil {
 		t.Fatal("bad --by accepted")
 	}
 }
@@ -172,5 +172,27 @@ func TestHumanize(t *testing.T) {
 		if got := humanize(n); got != want {
 			t.Fatal(n, got)
 		}
+	}
+}
+
+func TestBlameShowsEachRowsModelsAndGroupsByModel(t *testing.T) {
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	rec := func(session, model string, out int64) requestRecord {
+		r := requestRecord{Time: now.Add(-time.Hour), Account: "work", Session: session, Model: model}
+		r.OutputTokens = out
+		return r
+	}
+	records := []requestRecord{rec("s1", "claude-opus-5-5", 900), rec("s1", "claude-haiku-5-5", 100), rec("s2", "claude-opus-5-5", 10)}
+	none := func(string) transcriptInfo { return transcriptInfo{"?", "?"} }
+	rows := blame(records, blameOptions{by: "session"}, now, none)
+	if got := modelMix(rows[0].Models); rows[0].Key != "s1" || got != "opus-5-5 90%, haiku-5-5 10%" {
+		t.Fatal(rows[0].Key, got)
+	}
+	if got := modelMix(rows[1].Models); got != "opus-5-5" {
+		t.Fatal(got)
+	}
+	rows = blame(records, blameOptions{by: "model"}, now, none)
+	if len(rows) != 2 || rows[0].Key != "claude-opus-5-5" || rows[0].Requests != 2 || rows[1].Key != "claude-haiku-5-5" {
+		t.Fatalf("%+v", rows)
 	}
 }

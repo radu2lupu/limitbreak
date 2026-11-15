@@ -25,7 +25,7 @@ limitbreak renew [name...] [--all]
                                 give accounts a 1-year token (one browser authorization each)
 limitbreak share <ssh-host>     copy the 1-year tokens to the same-named accounts on another machine
 limitbreak remove <name> [-y]   sign an account out and delete its login
-limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client] [--json]
+limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client|model] [--json]
                                 which sessions used the limits (from the request log)
 limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]
                                 rebuild the request log before it began from Claude Code transcripts

@@ -99,7 +99,7 @@ The proxy appends one JSON line per Claude `/v1/messages` reply to `~/.local/sta
 limitbreak blame                       # last 24h, by session
 limitbreak blame --since 7d --by project
 limitbreak blame --account own         # what burned your own login
-limitbreak blame --by account --json   # also: --by client
+limitbreak blame --by account --json   # also: --by client, --by model; every other grouping shows its models
 ```
 
 ```

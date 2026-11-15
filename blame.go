@@ -60,6 +60,8 @@ type blameRow struct {
 	SevenDayRise float64 `json:"seven_day_rise"`
 	// Backfilled counts the replies rebuilt from transcripts (no utilization, account inferred).
 	Backfilled int `json:"backfilled"`
+	// Models is the weighted total per model the group ran on.
+	Models map[string]float64 `json:"models,omitempty"`
 }
 
 // transcriptInfo is what a session's transcript says about it; "?" where it says nothing.
@@ -128,6 +130,8 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 			key = rec.Account
 		case "client":
 			key = rec.Client
+		case "model":
+			key = rec.Model
 		default:
 			key = rec.Session
 		}
@@ -136,7 +140,7 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 		}
 		row := groups[key]
 		if row == nil {
-			row = &blameRow{Key: key}
+			row = &blameRow{Key: key, Models: map[string]float64{}}
 			if opts.by == "session" && rec.Session != "" {
 				si := sessionInfo(rec.Session)
 				row.Project, row.Title = si.Project, si.Title
@@ -148,7 +152,9 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 		row.CacheCreationInputTokens += rec.CacheCreationInputTokens
 		row.CacheReadInputTokens += rec.CacheReadInputTokens
 		row.OutputTokens += rec.OutputTokens
-		row.Weighted += weighted(rec.tokenUsage)
+		w := weighted(rec.tokenUsage)
+		row.Weighted += w
+		row.Models[cmp.Or(rec.Model, "?")] += w
 		row.FiveHourRise += rise5[i]
 		row.SevenDayRise += rise7[i]
 		if rec.Backfilled {
@@ -371,15 +377,15 @@ func blameCommand(home string, args []string, out io.Writer) error {
 	flags := flag.NewFlagSet("blame", flag.ContinueOnError)
 	since := flags.String("since", "24h", "how far back to look (24h, 90m, 7d)")
 	account := flags.String("account", "", "only this account (`own` is the client's own login)")
-	by := flags.String("by", "session", "group by session, project, account or client")
+	by := flags.String("by", "session", "group by session, project, account, client or model")
 	asJSON := flags.Bool("json", false, "print the rows as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	switch *by {
-	case "session", "project", "account", "client":
+	case "session", "project", "account", "client", "model":
 	default:
-		return fmt.Errorf("bad --by %q: use session, project, account or client", *by)
+		return fmt.Errorf("bad --by %q: use session, project, account, client or model", *by)
 	}
 	period, err := parseSince(*since)
 	if err != nil {
@@ -407,6 +413,9 @@ func blameCommand(home string, args []string, out io.Writer) error {
 func showBlame(out io.Writer, rows []blameRow, by string) {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	numbers := "REQ\tINPUT\tCACHE W\tCACHE R\tOUTPUT\tWEIGHTED\t5H\t7D"
+	if by != "model" {
+		numbers += "\tMODELS"
+	}
 	if by == "session" {
 		fmt.Fprintln(tw, "SESSION\tPROJECT\tTITLE\t"+numbers)
 	} else {
@@ -425,13 +434,46 @@ func showBlame(out io.Writer, rows []blameRow, by string) {
 		if by == "session" {
 			key += "\t" + cmp.Or(row.Project, "?") + "\t" + cmp.Or(row.Title, "?")
 		}
-		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", key, row.Requests,
+		models := ""
+		if by != "model" {
+			models = "\t" + modelMix(row.Models)
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n", key, row.Requests,
 			humanize(float64(row.InputTokens)), humanize(float64(row.CacheCreationInputTokens)),
 			humanize(float64(row.CacheReadInputTokens)), humanize(float64(row.OutputTokens)),
-			humanize(row.Weighted), points(row.FiveHourRise), points(row.SevenDayRise))
+			humanize(row.Weighted), points(row.FiveHourRise), points(row.SevenDayRise), models)
 	}
 	tw.Flush()
 	if rebuilt {
 		fmt.Fprintln(out, "* rebuilt from transcripts: account inferred from the switch log, no 5h/7d")
 	}
+}
+
+// modelMix is a row's models, heaviest first, without the `claude-` prefix: one model alone, or each
+// with its share of the row's weighted total ("opus-5-5 92%, haiku-5-5 8%").
+func modelMix(models map[string]float64) string {
+	names := make([]string, 0, len(models))
+	total := 0.0
+	for name, w := range models {
+		names = append(names, name)
+		total += w
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if models[names[i]] != models[names[j]] {
+			return models[names[i]] > models[names[j]]
+		}
+		return names[i] < names[j]
+	})
+	if len(names) == 1 {
+		return strings.TrimPrefix(names[0], "claude-")
+	}
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		share := 0.0
+		if total > 0 {
+			share = models[name] / total * 100
+		}
+		parts = append(parts, fmt.Sprintf("%s %.0f%%", strings.TrimPrefix(name, "claude-"), share))
+	}
+	return strings.Join(parts, ", ")
 }
