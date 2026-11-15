@@ -196,3 +196,28 @@ func TestBlameShowsEachRowsModelsAndGroupsByModel(t *testing.T) {
 		t.Fatalf("%+v", rows)
 	}
 }
+
+func TestAgentNamesAndPathTail(t *testing.T) {
+	home := t.TempDir()
+	dir := filepath.Join(home, meshACPDir, "member_agent_x")
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "profile.json"), []byte(`{"agentId":"x","snapshot":{"identity":{"name":"Ranjeet","role":"Developer"}}}`), 0o600)
+	if got := clientLabel(home, "member_agent_x"); got != "Ranjeet (Hi, computer)" {
+		t.Fatal(got)
+	}
+	if got := clientLabel(home, "shared"); got != "shared" {
+		t.Fatal(got)
+	}
+	if got := agentName(home, "../member_agent_x"); got != "" {
+		t.Fatal(got)
+	}
+	if got := projectLabel(home, filepath.Join(dir, "REPOS", "app")); got != "Hi, computer: Ranjeet/REPOS/app" {
+		t.Fatal(got)
+	}
+	if got := projectLabel(home, filepath.Join(home, "Code", "app")); got != "~/Code/app" {
+		t.Fatal(got)
+	}
+	if got := pathTail("/private/var/folders/T/acp-contract-1234", 12); got != "…ntract-1234" {
+		t.Fatal(got)
+	}
+}

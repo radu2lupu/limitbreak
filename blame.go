@@ -47,7 +47,11 @@ type blameOptions struct {
 
 // blameRow is one group's share of the usage.
 type blameRow struct {
-	Key     string `json:"key"`
+	Key string `json:"key"`
+	// Name is how the key is shown when it differs from the id (a Hi, computer agent's name).
+	Name string `json:"name,omitempty"`
+	// Client is the client a session ran as, by name for a Hi, computer agent (session rows only).
+	Client  string `json:"client,omitempty"`
 	Project string `json:"project,omitempty"`
 	Title   string `json:"title,omitempty"`
 	// Requests counts replies; the token counts are their sums.
@@ -144,6 +148,7 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 			if opts.by == "session" && rec.Session != "" {
 				si := sessionInfo(rec.Session)
 				row.Project, row.Title = si.Project, si.Title
+				row.Client = rec.Client
 			}
 			groups[key] = row
 		}
@@ -334,7 +339,7 @@ func sessionTranscript(home, id string) transcriptInfo {
 	cwd, title := transcriptFacts(head)
 	info := unknown
 	if cwd != "" {
-		info.Project = tildePath(home, cwd)
+		info.Project = projectLabel(home, cwd)
 	}
 	if title != "" {
 		info.Title = oneLine(title, titleWidth)
@@ -397,6 +402,20 @@ func blameCommand(home string, args []string, out io.Writer) error {
 	}
 	rows := blame(records, blameOptions{since: period, account: *account, by: *by}, time.Now(),
 		func(id string) transcriptInfo { return sessionTranscript(home, id) })
+	if *by == "client" {
+		for i := range rows {
+			if label := clientLabel(home, rows[i].Key); label != rows[i].Key {
+				rows[i].Name = label
+			}
+		}
+	}
+	if *by == "session" {
+		for i := range rows {
+			if name := agentName(home, rows[i].Client); name != "" {
+				rows[i].Client = name
+			}
+		}
+	}
 	if *asJSON {
 		enc := json.NewEncoder(out)
 		enc.SetIndent("", "  ")
@@ -417,13 +436,16 @@ func showBlame(out io.Writer, rows []blameRow, by string) {
 		numbers += "\tMODELS"
 	}
 	if by == "session" {
-		fmt.Fprintln(tw, "SESSION\tPROJECT\tTITLE\t"+numbers)
+		fmt.Fprintln(tw, "SESSION\tCLIENT\tPROJECT\tTITLE\t"+numbers)
 	} else {
 		fmt.Fprintln(tw, strings.ToUpper(by)+"\t"+numbers)
 	}
 	rebuilt := false
 	for _, row := range rows {
-		key := row.Key
+		key := cmp.Or(row.Name, row.Key)
+		if by == "project" {
+			key = pathTail(key, projectWidth)
+		}
 		if by == "session" && len(key) > 8 {
 			key = key[:8]
 		}
@@ -432,7 +454,7 @@ func showBlame(out io.Writer, rows []blameRow, by string) {
 			rebuilt = true
 		}
 		if by == "session" {
-			key += "\t" + cmp.Or(row.Project, "?") + "\t" + cmp.Or(row.Title, "?")
+			key += "\t" + cmp.Or(row.Client, "?") + "\t" + pathTail(cmp.Or(row.Project, "?"), projectWidth) + "\t" + cmp.Or(row.Title, "?")
 		}
 		models := ""
 		if by != "model" {
@@ -476,4 +498,63 @@ func modelMix(models map[string]float64) string {
 		parts = append(parts, fmt.Sprintf("%s %.0f%%", strings.TrimPrefix(name, "claude-"), share))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// agentName is the name a Hi, computer agent goes by (its profile's identity), for the client it
+// reaches the proxy as; "" when client is not one of its agents.
+func agentName(home, client string) string {
+	if client == "" || strings.ContainsAny(client, `/\`) || strings.HasPrefix(client, ".") {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(home, meshACPDir, client, "profile.json"))
+	if err != nil {
+		return ""
+	}
+	var profile struct {
+		Snapshot struct {
+			Identity struct {
+				Name string `json:"name"`
+			} `json:"identity"`
+		} `json:"snapshot"`
+	}
+	if json.Unmarshal(raw, &profile) != nil {
+		return ""
+	}
+	return strings.TrimSpace(profile.Snapshot.Identity.Name)
+}
+
+// clientLabel is a client as the report shows it: a Hi, computer agent by its name, any other by its id.
+func clientLabel(home, client string) string {
+	if name := agentName(home, client); name != "" {
+		return name + " (Hi, computer)"
+	}
+	return client
+}
+
+// projectLabel is a session's working directory as the report shows it: under ~, and a Hi, computer
+// agent's own folder by the agent's name.
+func projectLabel(home, cwd string) string {
+	if rest, ok := strings.CutPrefix(cwd, filepath.Join(home, meshACPDir)+string(filepath.Separator)); ok {
+		client, sub, _ := strings.Cut(rest, string(filepath.Separator))
+		if name := agentName(home, client); name != "" {
+			if sub == "" {
+				return "Hi, computer: " + name
+			}
+			return "Hi, computer: " + name + "/" + sub
+		}
+	}
+	return tildePath(home, cwd)
+}
+
+// projectWidth is the most of a project path the table shows; --json has it whole.
+const projectWidth = 48
+
+// pathTail is s cut to its last width runes behind an ellipsis, so a long path keeps the part that
+// tells it apart.
+func pathTail(s string, width int) string {
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	return "…" + string(r[len(r)-width+1:])
 }
