@@ -112,6 +112,8 @@ A session's project and title come from its transcript (`~/.claude*/projects/*/<
 
 `limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]` (default: since local midnight) rebuilds records for the replies before the log began from Claude Code's transcripts (the same dirs, subagent transcripts counted to their parent session), each reply once, and only up to the first record the proxy logged itself, so nothing counts twice. It replaces `requests.backfill.jsonl` beside the log, so it can be rerun; `blame` reads it too and marks those rows `*`. Their account is inferred from the switch log (`?` before a client's first logged switch; Hi, computer agents are their own `/_c/<client>`, everything else `shared`). A client can also move without a line of its own and a request that bypassed the proxy looks the same, so treat it as a guess; they have no 5h/7d.
 
+`GET /_usage?since=7d` (default 7d; any `--since` value) is the same for an app: each Claude account's `/_status` entry plus its weighted total over the period, its five heaviest sessions (title, project, client, weighted, whether rebuilt) and the weighted `rest`, and the totals that went on clients' own logins (`own`) and with no account recorded (`unrecorded`). A report is reused for 60 seconds. Hi, computer's Usage page is drawn from it.
+
 ## Codex
 
 The same proxy rotates Codex between ChatGPT sign-ins. Point Codex at it:

@@ -442,6 +442,8 @@ type proxy struct {
 	client *http.Client
 	// requests is where Claude inference replies are logged (requestlog.go); nil logs nothing.
 	requests *requestLog
+	// usage makes the `GET /_usage` reports (usage_report.go); nil answers 404.
+	usage *usageReports
 }
 
 func newProxy(pools ...*pool) *proxy {
@@ -477,6 +479,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/_status" {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(p.status())
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/_usage" && p.usage != nil {
+		p.usage.serve(w, r, p.pools[0].status)
 		return
 	}
 	clientName, path, ok := route(r.URL.RequestURI())
@@ -723,6 +729,7 @@ func serve(args []string) {
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
 	px := newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))
 	px.requests = newRequestLog(*homeFlag)
+	px.usage = &usageReports{home: *homeFlag}
 	log.Fatal(http.Serve(listener, px))
 }
 
