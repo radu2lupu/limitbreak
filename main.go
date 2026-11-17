@@ -152,8 +152,10 @@ type claudeAccounts struct {
 	credentials string
 	claude      string
 	now         func() time.Time
-	// mu serializes writes to the usage record.
+	// mu serializes writes to the usage record and guards keychainDownUntil.
 	mu sync.Mutex
+	// keychainDownUntil is when Keychain reads resume after one timed out.
+	keychainDownUntil time.Time
 }
 
 func newClaudeAccounts(home, credentials, claude string) *claudeAccounts {
@@ -247,8 +249,8 @@ func (a *claudeAccounts) credentialSources(configDir, path string) [][]byte {
 		// (an older sign-in under another account name) can be stale, so the user's is asked for
 		// first and any other is kept as a second source.
 		for _, args := range keychainQueries(configDir) {
-			out, err := exec.Command("security", args...).Output()
-			if err == nil && len(bytes.TrimSpace(out)) > 0 {
+			out, ok := a.readKeychain(args)
+			if ok && len(bytes.TrimSpace(out)) > 0 {
 				sources = append(sources, out)
 			}
 		}
@@ -257,6 +259,37 @@ func (a *claudeAccounts) credentialSources(configDir, path string) [][]byte {
 		sources = append(sources, raw)
 	}
 	return sources
+}
+
+// keychainTimeout bounds one `security` call, and keychainBackoff is how long every Keychain read is
+// skipped after one hit it. A locked login Keychain on a Mac nobody is signed in at (the Mini after a
+// reboot, an SSH session) makes `security` wait for a password prompt nobody can answer, which would
+// hang every request and with it every Claude Code session going through the proxy.
+const (
+	keychainTimeout = 3 * time.Second
+	keychainBackoff = time.Minute
+)
+
+// readKeychain runs one `security` query. ok is false when it failed or the Keychain is unreachable,
+// and after a timeout the Keychain is not asked again for keychainBackoff (the file source remains).
+func (a *claudeAccounts) readKeychain(args []string) (out []byte, ok bool) {
+	a.mu.Lock()
+	down := a.now().Before(a.keychainDownUntil)
+	a.mu.Unlock()
+	if down {
+		return nil, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), keychainTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "security", args...).Output()
+	if ctx.Err() != nil {
+		a.mu.Lock()
+		a.keychainDownUntil = a.now().Add(keychainBackoff)
+		a.mu.Unlock()
+		log.Printf("macOS Keychain did not answer within %s (locked?); using credential files for %s", keychainTimeout, keychainBackoff)
+		return nil, false
+	}
+	return out, err == nil
 }
 
 // token is a live access token, refreshed through Claude Code when every one has expired.

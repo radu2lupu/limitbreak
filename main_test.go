@@ -388,3 +388,30 @@ func TestStatusCarriesUsageAndAuthEndWithoutTokens(t *testing.T) {
 		t.Fatal("usage recorded for another login is not this account's", def.Usage)
 	}
 }
+
+func TestALockedKeychainCostsOneTimeoutThenIsSkippedForAWhile(t *testing.T) {
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "security"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	now := time.Now()
+	a := newClaudeAccounts(t.TempDir(), credentialsKeychain, "")
+	a.now = func() time.Time { return now }
+
+	start := time.Now()
+	if _, ok := a.readKeychain([]string{"find-generic-password"}); ok {
+		t.Fatal("a Keychain that never answers must not count as read")
+	}
+	if took := time.Since(start); took > keychainTimeout+2*time.Second {
+		t.Fatalf("first read took %s, want about %s", took, keychainTimeout)
+	}
+	start = time.Now()
+	if _, ok := a.readKeychain([]string{"find-generic-password"}); ok || time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("second read must be skipped at once, took %s", time.Since(start))
+	}
+	now = now.Add(keychainBackoff + time.Second)
+	if a.now().Before(a.keychainDownUntil) {
+		t.Fatal("Keychain reads must resume after the backoff")
+	}
+}
