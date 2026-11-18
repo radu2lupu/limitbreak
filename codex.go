@@ -342,21 +342,9 @@ func (a *codexAccounts) readUsage(acc account) ([]usageWindow, error) {
 	if !ok {
 		return nil, errors.New("no sign-in")
 	}
-	req, err := http.NewRequest(http.MethodGet, a.upstream+codexUsagePath, nil)
+	raw, err := fetchUsage(a.client, a.upstream+codexUsagePath, map[string]string{"Authorization": "Bearer " + l.token, "Chatgpt-Account-Id": l.accountID})
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+l.token)
-	req.Header.Set("Chatgpt-Account-Id", l.accountID)
-	req.Header.Set("User-Agent", "limitbreak")
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	windows, _, err := whamWindows(raw, a.now())
 	return windows, err

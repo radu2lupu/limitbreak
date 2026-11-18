@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -353,21 +352,9 @@ func (a *grokAccounts) readUsage(acc account) ([]usageWindow, error) {
 	if !l.expires.IsZero() && !l.expires.After(a.now()) {
 		return nil, errors.New("token ended; grok refreshes it on its next run")
 	}
-	req, err := http.NewRequest(http.MethodGet, a.upstream+grokBillingPath, nil)
+	raw, err := fetchUsage(a.client, a.upstream+grokBillingPath, map[string]string{"Authorization": "Bearer " + l.token, grokTokenAuthKey: grokTokenAuth})
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+l.token)
-	req.Header.Set(grokTokenAuthKey, grokTokenAuth)
-	req.Header.Set("User-Agent", "limitbreak")
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return grokBillingWindows(raw, a.now())
 }

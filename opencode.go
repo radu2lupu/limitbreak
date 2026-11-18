@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
@@ -224,20 +223,9 @@ func (o *opencodeAccounts) report(since time.Duration) []usageAccount {
 }
 
 func (o *opencodeAccounts) readUsage(key string) ([]usageWindow, error) {
-	req, err := http.NewRequest(http.MethodGet, o.usageURL, nil)
+	raw, err := fetchUsage(o.client, o.usageURL, map[string]string{"Authorization": "Bearer " + key})
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+key)
-	req.Header.Set("User-Agent", "limitbreak")
-	resp, err := o.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	return opencodeWindows(raw, o.now())
 }

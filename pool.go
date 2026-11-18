@@ -6,6 +6,8 @@ package main
 // until when. What differs between providers is behind the interface; the rotation is the pool's.
 
 import (
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -327,4 +329,27 @@ func accountLabel(acc account) string {
 		return acc.Email
 	}
 	return acc.ID
+}
+
+// fetchUsage is the body of a GET for an account's usage at url with headers set (credentials
+// among them); an error for any status but 200. Every provider reads its usage endpoint through it.
+func fetchUsage(client *http.Client, url string, headers map[string]string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	for name, value := range headers {
+		req.Header.Set(name, value)
+	}
+	req.Header.Set("User-Agent", "limitbreak")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return raw, nil
 }
