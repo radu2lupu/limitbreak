@@ -112,7 +112,7 @@ A session's project and title come from its transcript (`~/.claude*/projects/*/<
 
 `limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]` (default: since local midnight) rebuilds records for the replies before the log began from Claude Code's transcripts (the same dirs, subagent transcripts counted to their parent session), each reply once, and only up to the first record the proxy logged itself, so nothing counts twice. It replaces `requests.backfill.jsonl` beside the log, so it can be rerun; `blame` reads it too and marks those rows `*`. Their account is inferred from the switch log (`?` before a client's first logged switch; Hi, computer agents are their own `/_c/<client>`, everything else `shared`). A client can also move without a line of its own and a request that bypassed the proxy looks the same, so treat it as a guess; they have no 5h/7d.
 
-`GET /_usage?since=7d` (default 7d; any `--since` value) is the same for an app: each Claude account's `/_status` entry plus its weighted total over the period, its five heaviest sessions (title, project, client, weighted, whether rebuilt) and the weighted `rest`, and the totals that went on clients' own logins (`own`) and with no account recorded (`unrecorded`). A report is reused for 60 seconds. Hi, computer's Usage page is drawn from it.
+`GET /_usage?since=7d` (default 7d; any `--since` value) is the same for an app: every account's `/_status` entry (Claude, Codex and Grok, each with its windows) plus its weighted total over the period, its five heaviest sessions (title, project, client, weighted, whether rebuilt) and the weighted `rest`, and the totals that went on clients' own logins (`own`) and with no account recorded (`unrecorded`). Only Claude replies are logged, so Codex and Grok accounts come with their windows and no sessions. [OpenCode](#opencode)'s accounts are added after them. A report is reused for 60 seconds. Hi, computer's Usage page is drawn from it.
 
 ## Codex
 
@@ -158,9 +158,18 @@ How limitbreak handles it:
 - Usage per account (`windows`) is the billing period above, read at most once every 5 minutes: `{"id":"weekly","label":"weekly","usedPercent":46,"resetsAt":…,"windowMinutes":10080}`. `authEnds` is null (grok's refresh keeps the sign-in going).
 - Replaying a turn on another Grok account has not been tried yet with two subscriptions; server-side session state (`X-Grok-Conv-Id`, storage) stays on grok's own login.
 
+## OpenCode
+
+limitbreak does not proxy OpenCode; it only reads its accounts for `GET /_usage`. They are OpenCode's own keys in `~/.local/share/opencode/auth.json`:
+
+- `opencode-go`, the Go subscription: its rolling 5-hour, weekly and monthly windows come from `GET https://opencode.ai/zen/go/v1/usage` with the key (it spends nothing), at most once every 5 minutes. A window at 100% marks the account spent until it resets.
+- `opencode`, Zen: paid as you go, so it has no window and is reported with `noLimit: true`.
+
+Other providers OpenCode holds keys for (OpenRouter, say) are not listed. Each account's weighted total is its provider's tokens from `opencode stats --json --models --days N`, reasoning counted as output. `opencode stats` takes a few seconds, so it runs in the background every 5 minutes and a report uses the last totals read. It counts calendar days (`--days 0` is today, used for any period under a day), so the totals are approximate, and it does not split a provider by session: the whole total is the account's `rest`.
+
 ## Options
 
-`limitbreak serve --port 48617 --upstream https://api.anthropic.com --codex-upstream https://chatgpt.com --grok-upstream https://cli-chat-proxy.grok.com --home ~ --credentials auto|keychain|file`
+`limitbreak serve --port 48617 --upstream https://api.anthropic.com --codex-upstream https://chatgpt.com --grok-upstream https://cli-chat-proxy.grok.com --opencode-usage https://opencode.ai/zen/go/v1/usage --home ~ --credentials auto|keychain|file`
 
 A request path may begin with `/_c/<client>/` to give a client (an agent, a tool) its own active account; the prefix is stripped before forwarding. `/backend-api/…` paths are Codex's, `/grok/…` paths Grok's (the `/grok` comes off too), everything else Claude's.
 

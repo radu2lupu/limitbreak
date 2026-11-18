@@ -482,7 +482,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/_usage" && p.usage != nil {
-		p.usage.serve(w, r, p.pools[0].status)
+		p.usage.serve(w, r, p.status)
 		return
 	}
 	clientName, path, ok := route(r.URL.RequestURI())
@@ -715,6 +715,7 @@ func serve(args []string) {
 	codexUpstream := flags.String("codex-upstream", envString("LIMITBREAK_CODEX_UPSTREAM", defaultCodexUpstream), "ChatGPT backend address for Codex")
 	home, _ := os.UserHomeDir()
 	grokUpstream := flags.String("grok-upstream", envString("LIMITBREAK_GROK_UPSTREAM", defaultGrokUpstream), "Grok CLI chat proxy address")
+	opencodeUsage := flags.String("opencode-usage", envString("LIMITBREAK_OPENCODE_USAGE", defaultOpencodeURL), "OpenCode Go usage address")
 	homeFlag := flags.String("home", home, "home dir holding the Claude, Codex and Grok logins")
 	credentials := flags.String("credentials", "auto", "auto, keychain or file")
 	_ = flags.Parse(args)
@@ -729,7 +730,9 @@ func serve(args []string) {
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
 	px := newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))
 	px.requests = newRequestLog(*homeFlag)
-	px.usage = &usageReports{home: *homeFlag}
+	opencode := newOpencodeAccounts(*homeFlag, *opencodeUsage)
+	opencode.tokensFor(opencodeDays(defaultUsageSince))
+	px.usage = &usageReports{home: *homeFlag, others: opencode.report}
 	log.Fatal(http.Serve(listener, px))
 }
 

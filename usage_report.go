@@ -1,8 +1,9 @@
 package main
 
-// `GET /_usage` is the Claude accounts' fuel: each account's status (its 5-hour and weekly windows,
-// whether it is spent, which clients are on it) with the sessions that used it over the period, from
-// the request log (blame.go). Hi, computer draws its Usage page from it. Like `/_status` it holds no
+// `GET /_usage` is every account's fuel: each account's status (its windows, whether it is spent,
+// which clients are on it) for Claude, Codex, Grok and OpenCode (opencode.go). A Claude account also
+// lists the sessions that used it over the period, from the request log (blame.go); an OpenCode one
+// its total from OpenCode's own stats. Hi, computer draws its Usage page from it. Like `/_status` it holds no
 // token and no prompt text.
 
 import (
@@ -41,6 +42,9 @@ type usageAccount struct {
 	// Sessions are its heaviest sessions, heaviest first; Rest is the weighted total of the others.
 	Sessions []usageSession `json:"sessions"`
 	Rest     float64        `json:"rest"`
+	// NoLimit is true when the provider has no usage limit for the account (OpenCode Zen is paid as
+	// you go), so it has no window to draw; an account with no windows otherwise just was not read.
+	NoLimit bool `json:"noLimit,omitempty"`
 }
 
 // usageReport is the body of `GET /_usage`.
@@ -89,7 +93,8 @@ func accountSessions(records []requestRecord, cutoff time.Time) map[string][]usa
 	return out
 }
 
-// buildUsageReport joins the accounts' status with their sessions. info resolves a listed session's
+// buildUsageReport joins the accounts' status with their sessions. Only Claude replies are logged, so
+// only Claude accounts get sessions; the others are listed with none. info resolves a listed session's
 // transcript and name a client's agent name; each is asked only for the sessions that are listed.
 func buildUsageReport(status []accountStatus, records []requestRecord, since time.Duration, now time.Time,
 	info func(session string) transcriptInfo, name func(client string) string) usageReport {
@@ -105,10 +110,10 @@ func buildUsageReport(status []accountStatus, records []requestRecord, since tim
 	report := usageReport{Since: cutoff.Unix(), Generated: now.Unix(), Accounts: []usageAccount{},
 		Own: total(bySession[ownAccount]), Unrecorded: total(bySession["?"])}
 	for _, st := range status {
-		if st.Provider != "claude" {
-			continue
+		var list []usageSession
+		if st.Provider == "claude" {
+			list = bySession[st.ID]
 		}
-		list := bySession[st.ID]
 		acc := usageAccount{accountStatus: st, Weighted: total(list), Sessions: []usageSession{}}
 		for i, s := range list {
 			if i >= usageReportSessions {
@@ -135,8 +140,10 @@ func buildUsageReport(status []accountStatus, records []requestRecord, since tim
 // usageReports makes `/_usage` reports for one home, reusing one for usageReportTTL per period.
 type usageReports struct {
 	home string
-	mu   sync.Mutex
-	kept map[time.Duration]keptReport
+	// others are accounts limitbreak does not proxy (OpenCode's), added after the proxied ones.
+	others func(since time.Duration) []usageAccount
+	mu     sync.Mutex
+	kept   map[time.Duration]keptReport
 }
 
 type keptReport struct {
@@ -168,6 +175,9 @@ func (u *usageReports) serve(w http.ResponseWriter, r *http.Request, status func
 		kept = keptReport{made: now, report: buildUsageReport(status(), records, since, now,
 			func(id string) transcriptInfo { return sessionTranscript(u.home, id) },
 			func(client string) string { return agentName(u.home, client) })}
+		if u.others != nil {
+			kept.report.Accounts = append(kept.report.Accounts, u.others(since)...)
+		}
 		if u.kept == nil {
 			u.kept = map[time.Duration]keptReport{}
 		}

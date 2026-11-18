@@ -19,12 +19,15 @@ func TestUsageReportListsEachAccountsHeaviestSessionsAndSumsTheRest(t *testing.T
 	for i := 0; i < usageReportSessions; i++ {
 		records = append(records, rec(5, "work", string(rune('p'+i)), nil, nil, tokenUsage{InputTokens: 1}))
 	}
-	status := []accountStatus{{ID: "work", Provider: "claude"}, {ID: "home", Provider: "claude"}, {ID: "cx", Provider: "codex"}}
+	status := []accountStatus{{ID: "work", Provider: "claude"}, {ID: "home", Provider: "claude"}, {ID: "work", Provider: "codex"}}
 	asked := 0
 	info := func(id string) transcriptInfo { asked++; return transcriptInfo{Project: "~/p", Title: "title " + id} }
 	report := buildUsageReport(status, records, 7*24*time.Hour, blameNow, info, func(string) string { return "" })
-	if len(report.Accounts) != 2 {
-		t.Fatalf("codex account listed or claude one missing: %+v", report.Accounts)
+	if len(report.Accounts) != 3 {
+		t.Fatalf("every provider's account should be listed: %+v", report.Accounts)
+	}
+	if cx := report.Accounts[2]; cx.Provider != "codex" || cx.Weighted != 0 || len(cx.Sessions) != 0 {
+		t.Fatalf("a codex account sharing a claude id took its sessions: %+v", cx)
 	}
 	work := report.Accounts[0]
 	if work.ID != "work" || work.Weighted != 15000+usageReportSessions || len(work.Sessions) != usageReportSessions {
