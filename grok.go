@@ -221,12 +221,18 @@ func newGrokAccounts(home, grok, upstream string) *grokAccounts {
 // findGrok is grok on PATH, else where its installer puts it (~/.grok/bin/grok), which a launchd
 // service's PATH does not have.
 func findGrok(home string) string {
-	if path, err := exec.LookPath("grok"); err == nil {
+	return findInstalled("grok", filepath.Join(home, ".grok", "bin", "grok"))
+}
+
+// findInstalled is the tool name on PATH, else the first of paths that is a file; empty when none is.
+func findInstalled(name string, paths ...string) string {
+	if path, err := exec.LookPath(name); err == nil {
 		return path
 	}
-	path := filepath.Join(home, ".grok", "bin", "grok")
-	if info, err := os.Stat(path); err == nil && !info.IsDir() {
-		return path
+	for _, path := range paths {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
 	}
 	return ""
 }
