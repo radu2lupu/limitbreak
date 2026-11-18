@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,9 @@ limitbreak add [name]           sign in a new account (opens the browser)
 limitbreak list                 show the accounts and when each one's login ends
 limitbreak renew [name...] [--all]
                                 give accounts a 1-year token (one browser authorization each)
-limitbreak share <ssh-host>     copy the 1-year tokens to the same-named accounts on another machine
+limitbreak share <ssh-host> [name...]
+                                copy the 1-year tokens (all, or the named accounts) to the same-named
+                                accounts on another machine
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client|model] [--json]
                                 which sessions used the limits (from the request log)
@@ -958,16 +961,29 @@ func sshImport(host, id string, record []byte) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// shareTokens copies every account's unexpired 1-year token to the same-named account on host.
+// shareTokens copies the unexpired 1-year token of every account, or of the accounts named after
+// host, to the same-named account on host.
 func shareTokens(a *claudeAccounts, args []string, send remoteImport, out io.Writer) error {
-	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: limitbreak share <ssh-host>")
+	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
+		return fmt.Errorf("usage: limitbreak share <ssh-host> [name...]")
 	}
 	host := args[0]
+	accounts := a.list()
+	if names := args[1:]; len(names) > 0 {
+		var picked []account
+		for _, name := range names {
+			i := slices.IndexFunc(accounts, func(acc account) bool { return acc.ID == name })
+			if i < 0 {
+				return fmt.Errorf("no account named %q here", name)
+			}
+			picked = append(picked, accounts[i])
+		}
+		accounts = picked
+	}
 	now := a.now()
 	var failed []string
 	shared := 0
-	for _, acc := range a.list() {
+	for _, acc := range accounts {
 		t, ok := a.readLongToken(acc)
 		if !ok || !t.valid(now) {
 			fmt.Fprintf(out, "%s has no 1-year token; skipped (run limitbreak renew %s).\n", acc.ID, acc.ID)

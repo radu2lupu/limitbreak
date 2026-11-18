@@ -505,3 +505,24 @@ func TestAddRefusesAnotherToolsDirAndCodexRemoveKeepsWhatItDidNotMake(t *testing
 		t.Fatal("a dir Limit Break made survived remove")
 	}
 }
+
+func TestShareSendsOnlyTheNamedAccounts(t *testing.T) {
+	src := newClaudeAccounts(makeHome(t, map[string]string{"default": "a", "founder": "b"}), credentialsFile, "")
+	now := time.Now()
+	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
+	src.writeLongToken(accountNamed(t, src, "founder"), newLongToken("sk-ant-oat01-founder", now))
+	var sent []string
+	send := func(host, id string, record []byte) (string, error) {
+		sent = append(sent, id)
+		return "", nil
+	}
+	if err := shareTokens(src, []string{"mini", "founder"}, send, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(sent, ",") != "founder" {
+		t.Fatal(sent)
+	}
+	if shareTokens(src, []string{"mini", "nobody"}, send, &bytes.Buffer{}) == nil {
+		t.Fatal("an unknown account name was accepted")
+	}
+}
