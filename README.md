@@ -163,7 +163,7 @@ How limitbreak handles it:
 limitbreak does not proxy OpenCode; it only reads its accounts for `GET /_usage`. They are OpenCode's own keys in `~/.local/share/opencode/auth.json`:
 
 - `opencode-go`, the Go subscription: its rolling 5-hour, weekly and monthly windows come from `GET https://opencode.ai/zen/go/v1/usage` with the key (it spends nothing), at most once every 5 minutes. A window at 100% marks the account spent until it resets.
-- `opencode`, Zen: paid as you go, so it has no window and is reported with `noLimit: true`.
+- `opencode`, Zen: paid as you go, so it has no window and is reported with `noLimit: true`. OpenCode keeps this key for its free models too, so Zen is listed only when `opencode stats` shows it cost money over the period; a Zen key used only for free models is left out.
 
 Other providers OpenCode holds keys for (OpenRouter, say) are not listed. Each account's weighted total is its provider's tokens from `opencode stats --json --models --days N`, reasoning counted as output. `opencode stats` takes a few seconds, so it runs in the background every 5 minutes and a report uses the last totals read. It counts calendar days (`--days 0` is today, used for any period under a day), so the totals are approximate, and it does not split a provider by session: the whole total is the account's `rest`.
 

@@ -32,16 +32,16 @@ func TestOpencodeWindowsReadsRollingWeeklyAndMonthly(t *testing.T) {
 	}
 }
 
-func TestOpencodeTokensSumsEachProvidersModels(t *testing.T) {
+func TestOpencodeUsesSumsEachProvidersModels(t *testing.T) {
 	raw := []byte(`{"models":[{"model":{"id":"a","providerID":"opencode-go"},"tokens":{"input":10,"output":2,"reasoning":3,"cache":{"read":100,"write":4}}},` +
-		`{"model":{"id":"b","providerID":"opencode-go"},"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}},` +
+		`{"model":{"id":"b","providerID":"opencode-go"},"cost":1.25,"tokens":{"input":1,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}},` +
 		`{"model":{"id":"c","providerID":"openrouter"},"tokens":{"input":7}}]}`)
-	got, err := opencodeTokens(raw)
+	got, err := opencodeUses(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := tokenUsage{InputTokens: 11, CacheCreationInputTokens: 4, CacheReadInputTokens: 100, OutputTokens: 5}
-	if got["opencode-go"] != want || got["openrouter"].InputTokens != 7 {
+	if got["opencode-go"].tokens != want || got["opencode-go"].cost != 1.25 || got["openrouter"].tokens.InputTokens != 7 || got["openrouter"].cost != 0 {
 		t.Fatalf("tokens %+v", got)
 	}
 	if opencodeDays(5*time.Hour) != 0 || opencodeDays(7*24*time.Hour) != 7 || opencodeDays(36*time.Hour) != 2 {
@@ -49,7 +49,7 @@ func TestOpencodeTokensSumsEachProvidersModels(t *testing.T) {
 	}
 }
 
-func TestOpencodeReportListsGoWithWindowsAndZenWithNone(t *testing.T) {
+func TestOpencodeReportListsGoWithWindowsAndPaidZenWithNone(t *testing.T) {
 	var asked atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		asked.Add(1)
@@ -73,20 +73,14 @@ func TestOpencodeReportListsGoWithWindowsAndZenWithNone(t *testing.T) {
 			if days != 7 {
 				return nil, errors.New("wrong days")
 			}
-			return []byte(`{"models":[{"model":{"providerID":"opencode-go"},"tokens":{"output":1000}}]}`), nil
+			return []byte(`{"models":[{"model":{"providerID":"opencode-go"},"tokens":{"output":1000}},{"model":{"providerID":"opencode"},"cost":0.4,"tokens":{"output":10}}]}`), nil
 		}}
 	first := o.report(7 * 24 * time.Hour)
-	if len(first) != 2 || first[0].ID != "opencode-go" || first[1].ID != "opencode" {
-		t.Fatalf("accounts %+v", first)
+	if len(first) != 1 || first[0].ID != "opencode-go" {
+		t.Fatalf("before stats are read only Go is known to be in use: %+v", first)
 	}
 	if first[0].Provider != opencodeProvider || len(first[0].Windows) != 1 || first[0].Windows[0].UsedPercent != 3 {
 		t.Fatalf("go %+v", first[0])
-	}
-	if first[0].NoLimit || !first[1].NoLimit {
-		t.Fatalf("only zen has no limit: %+v", first)
-	}
-	if len(first[1].Windows) != 0 {
-		t.Fatalf("zen has no limit, so no window: %+v", first[1].Windows)
 	}
 	<-statsDone
 	for running := true; running; {
@@ -96,10 +90,45 @@ func TestOpencodeReportListsGoWithWindowsAndZenWithNone(t *testing.T) {
 	}
 	clock.Store(int64(time.Minute))
 	second := o.report(7 * 24 * time.Hour)
-	if second[0].Weighted != 5000 || second[0].Rest != 5000 || second[1].Weighted != 0 {
+	if len(second) != 2 || second[1].ID != "opencode" {
+		t.Fatalf("zen spent money, so it is listed: %+v", second)
+	}
+	if second[0].NoLimit || !second[1].NoLimit || len(second[1].Windows) != 0 {
+		t.Fatalf("only zen has no limit, and no window: %+v", second)
+	}
+	if second[0].Weighted != 5000 || second[0].Rest != 5000 || second[1].Weighted != 50 {
 		t.Fatalf("tokens not used once read: %+v", second)
 	}
 	if asked.Load() != 1 {
 		t.Fatalf("usage read %d times inside its interval", asked.Load())
+	}
+}
+
+func TestOpencodeReportLeavesOutZenThatSpentNothing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{}}`))
+	}))
+	defer server.Close()
+	auth := filepath.Join(t.TempDir(), "auth.json")
+	if err := os.WriteFile(auth, []byte(`{"opencode-go":{"type":"api","key":"go-key"},"opencode":{"type":"api","key":"zen"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statsDone := make(chan struct{}, 1)
+	o := &opencodeAccounts{auth: auth, usageURL: server.URL, client: server.Client(), now: func() time.Time { return blameNow },
+		stats: func(int) ([]byte, error) {
+			defer func() { statsDone <- struct{}{} }()
+			// Zen's key used only for free models: tokens, but no cost.
+			return []byte(`{"models":[{"model":{"providerID":"opencode"},"cost":0,"tokens":{"output":900}}]}`), nil
+		}}
+	o.report(7 * 24 * time.Hour)
+	<-statsDone
+	for running := true; running; {
+		o.mu.Lock()
+		running = o.tokens[7].running
+		o.mu.Unlock()
+	}
+	got := o.report(7 * 24 * time.Hour)
+	if len(got) != 1 || got[0].ID != "opencode-go" {
+		t.Fatalf("a Zen key that spent nothing is not a Zen account: %+v", got)
 	}
 }

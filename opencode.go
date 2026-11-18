@@ -4,7 +4,8 @@ package main
 // own keys in `~/.local/share/opencode/auth.json`: "opencode-go", the Go subscription, whose rolling
 // 5-hour, weekly and monthly windows come from `GET https://opencode.ai/zen/go/v1/usage` (it spends
 // nothing), and "opencode", Zen, which is paid as you go and has no window. What each one used over
-// the period comes from `opencode stats --json --models`, summed by provider.
+// the period comes from `opencode stats --json --models`, summed by provider. OpenCode keeps a Zen
+// key for its free models too, so Zen is listed only when it spent money over the period.
 
 import (
 	"context"
@@ -30,7 +31,8 @@ const (
 	opencodeStatsEvery = 5 * time.Minute
 )
 
-// opencodeKinds are the OpenCode keys shown, in order. limited is whether the key has windows.
+// opencodeKinds are the OpenCode keys shown, in order. limited is whether the key has windows; an
+// unlimited one is shown only when it spent money (see opencodeShown).
 var opencodeKinds = []struct {
 	id, label, plan string
 	limited         bool
@@ -85,14 +87,28 @@ func opencodeSpentUntil(windows []usageWindow) *int64 {
 	return until
 }
 
-// opencodeTokens is each provider's tokens in an `opencode stats --json --models` reply. Reasoning
+// opencodeUse is what one OpenCode provider used over a period: its tokens and what they cost in
+// dollars (0 for free models).
+type opencodeUse struct {
+	tokens tokenUsage
+	cost   float64
+}
+
+// opencodeShown is whether a key is listed: a limited one always, an unlimited (paid as you go) one
+// only when it cost something, since OpenCode keeps a Zen key for its free models as well.
+func opencodeShown(limited bool, use opencodeUse) bool {
+	return limited || use.cost > 0
+}
+
+// opencodeUses is each provider's use in an `opencode stats --json --models` reply. Reasoning
 // counts as output.
-func opencodeTokens(raw []byte) (map[string]tokenUsage, error) {
+func opencodeUses(raw []byte) (map[string]opencodeUse, error) {
 	var doc struct {
 		Models []struct {
 			Model struct {
 				ProviderID string `json:"providerID"`
 			} `json:"model"`
+			Cost   float64 `json:"cost"`
 			Tokens struct {
 				Input     int64 `json:"input"`
 				Output    int64 `json:"output"`
@@ -107,13 +123,14 @@ func opencodeTokens(raw []byte) (map[string]tokenUsage, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
-	out := map[string]tokenUsage{}
+	out := map[string]opencodeUse{}
 	for _, m := range doc.Models {
 		u := out[m.Model.ProviderID]
-		u.InputTokens += m.Tokens.Input
-		u.CacheCreationInputTokens += m.Tokens.Cache.Write
-		u.CacheReadInputTokens += m.Tokens.Cache.Read
-		u.OutputTokens += m.Tokens.Output + m.Tokens.Reasoning
+		u.tokens.InputTokens += m.Tokens.Input
+		u.tokens.CacheCreationInputTokens += m.Tokens.Cache.Write
+		u.tokens.CacheReadInputTokens += m.Tokens.Cache.Read
+		u.tokens.OutputTokens += m.Tokens.Output + m.Tokens.Reasoning
+		u.cost += m.Cost
 		out[m.Model.ProviderID] = u
 	}
 	return out, nil
@@ -146,7 +163,7 @@ type opencodeAccounts struct {
 type keptTokens struct {
 	read    time.Time
 	running bool
-	byKey   map[string]tokenUsage
+	byKey   map[string]opencodeUse
 }
 
 func newOpencodeAccounts(home, usageURL string) *opencodeAccounts {
@@ -200,7 +217,8 @@ func (o *opencodeAccounts) report(since time.Duration) []usageAccount {
 	tokens := o.tokensFor(opencodeDays(since))
 	for _, kind := range opencodeKinds {
 		key, ok := keys[kind.id]
-		if !ok {
+		use := tokens[kind.id]
+		if !ok || !opencodeShown(kind.limited, use) {
 			continue
 		}
 		st := accountStatus{ID: kind.id, Provider: opencodeProvider, Label: kind.label, Plan: kind.plan,
@@ -215,7 +233,7 @@ func (o *opencodeAccounts) report(since time.Duration) []usageAccount {
 			}
 			st.SpentUntil = opencodeSpentUntil(st.Windows)
 		}
-		used := weighted(tokens[kind.id])
+		used := weighted(use.tokens)
 		// OpenCode's stats do not split a provider by session: the whole period is one share.
 		out = append(out, usageAccount{accountStatus: st, Weighted: used, Sessions: []usageSession{}, Rest: used, NoLimit: !kind.limited})
 	}
@@ -232,7 +250,7 @@ func (o *opencodeAccounts) readUsage(key string) ([]usageWindow, error) {
 
 // tokensFor is the last token totals read for days, starting a read in the background when they
 // are older than opencodeStatsEvery and none is running.
-func (o *opencodeAccounts) tokensFor(days int) map[string]tokenUsage {
+func (o *opencodeAccounts) tokensFor(days int) map[string]opencodeUse {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.tokens == nil {
@@ -249,9 +267,9 @@ func (o *opencodeAccounts) tokensFor(days int) map[string]tokenUsage {
 
 func (o *opencodeAccounts) readTokens(days int) {
 	raw, err := o.stats(days)
-	var byKey map[string]tokenUsage
+	var byKey map[string]opencodeUse
 	if err == nil {
-		byKey, err = opencodeTokens(raw)
+		byKey, err = opencodeUses(raw)
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
