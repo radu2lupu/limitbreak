@@ -39,6 +39,9 @@ type tokenUsage struct {
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	OutputTokens             int64 `json:"output_tokens"`
+	// CacheWrite1hInputTokens is the part of the cache write kept for an hour (the rest is kept for
+	// 5 minutes); only the proxy's own records have it.
+	CacheWrite1hInputTokens int64 `json:"cache_creation_1h_input_tokens,omitempty"`
 }
 
 // requestRecord is one line of the request log.
@@ -70,6 +73,29 @@ func requestsBackfillPath(home string) string {
 }
 
 // MARK: Decisions (pure)
+
+// sessionHeaders name the session a request belongs to, per client: Claude Code, Codex, Grok Build.
+var sessionHeaders = []string{sessionHeader, "Session_id", "X-Grok-Conv-Id"}
+
+// accountKey names an account across providers in the log's reports: a Claude account by its id (as
+// records before other providers were logged have it), any other as `<provider>:<id>`, since ids
+// such as `default` repeat between providers.
+func accountKey(provider, account string) string {
+	if provider == "" || provider == "claude" {
+		return account
+	}
+	return provider + ":" + account
+}
+
+// requestSession is the session a request's headers name; empty when none does.
+func requestSession(h http.Header) string {
+	for _, name := range sessionHeaders {
+		if v := h.Get(name); v != "" {
+			return v
+		}
+	}
+	return ""
+}
 
 // agentOf is the kind of client a User-Agent names: `sdk` for an Agent SDK session, `cli` for the
 // terminal app, else the product token (`curl`).
@@ -115,34 +141,76 @@ type usageTally struct {
 	usage tokenUsage
 }
 
-// apply takes in one JSON document: a stream event (message_start carries `message.usage`,
-// message_delta a top-level `usage` whose output count is cumulative) or a whole JSON reply. The
-// latest non-zero value of each count wins, so the final delta's output count is the one kept.
+// replyUsage is a reply's `usage` object in any of the shapes the proxied APIs send: Anthropic's
+// (input without the cache), or OpenAI's Responses (Codex, Grok) and Chat Completions ones, whose
+// input or prompt count includes the cached part.
+type replyUsage struct {
+	InputTokens              int64 `json:"input_tokens"`
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	CacheCreation            struct {
+		OneHour int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	TotalTokens        int64 `json:"total_tokens"`
+	PromptTokens       int64 `json:"prompt_tokens"`
+	CompletionTokens   int64 `json:"completion_tokens"`
+	InputTokensDetails struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+	PromptTokensDetails struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+}
+
+// tokens is the usage in Anthropic's terms: fresh input, cache write, cache read, output. Only
+// OpenAI's shapes carry total_tokens.
+func (u replyUsage) tokens() tokenUsage {
+	if u.TotalTokens == 0 {
+		return tokenUsage{InputTokens: u.InputTokens, CacheCreationInputTokens: u.CacheCreationInputTokens,
+			CacheReadInputTokens: u.CacheReadInputTokens, OutputTokens: u.OutputTokens,
+			CacheWrite1hInputTokens: u.CacheCreation.OneHour}
+	}
+	input := u.InputTokens + u.PromptTokens
+	cached := u.InputTokensDetails.CachedTokens + u.PromptTokensDetails.CachedTokens
+	return tokenUsage{InputTokens: max(input-cached, 0), CacheReadInputTokens: cached,
+		OutputTokens: u.OutputTokens + u.CompletionTokens}
+}
+
+// apply takes in one JSON document: a stream event (Anthropic's message_start carries
+// `message.usage` and message_delta a top-level `usage` whose output count is cumulative; a
+// Responses stream's response.completed carries `response.usage`) or a whole JSON reply. The latest
+// non-zero value of each count wins, so the final delta's output count is the one kept.
 func (t *usageTally) apply(raw []byte) {
+	type nested struct {
+		Model string      `json:"model"`
+		Usage *replyUsage `json:"usage"`
+	}
 	var doc struct {
-		Model   string      `json:"model"`
-		Usage   *tokenUsage `json:"usage"`
-		Message *struct {
-			Model string      `json:"model"`
-			Usage *tokenUsage `json:"usage"`
-		} `json:"message"`
+		Model    string      `json:"model"`
+		Usage    *replyUsage `json:"usage"`
+		Message  *nested     `json:"message"`
+		Response *nested     `json:"response"`
 	}
 	if json.Unmarshal(raw, &doc) != nil {
 		return
 	}
 	t.merge(doc.Model, doc.Usage)
-	if doc.Message != nil {
-		t.merge(doc.Message.Model, doc.Message.Usage)
+	for _, n := range []*nested{doc.Message, doc.Response} {
+		if n != nil {
+			t.merge(n.Model, n.Usage)
+		}
 	}
 }
 
-func (t *usageTally) merge(model string, u *tokenUsage) {
+func (t *usageTally) merge(model string, ru *replyUsage) {
 	if model != "" {
 		t.model = model
 	}
-	if u == nil {
+	if ru == nil {
 		return
 	}
+	u := ru.tokens()
 	for _, f := range []struct {
 		to   *int64
 		from int64
@@ -151,6 +219,7 @@ func (t *usageTally) merge(model string, u *tokenUsage) {
 		{&t.usage.CacheCreationInputTokens, u.CacheCreationInputTokens},
 		{&t.usage.CacheReadInputTokens, u.CacheReadInputTokens},
 		{&t.usage.OutputTokens, u.OutputTokens},
+		{&t.usage.CacheWrite1hInputTokens, u.CacheWrite1hInputTokens},
 	} {
 		if f.from != 0 {
 			*f.to = f.from
@@ -257,8 +326,7 @@ func isEventStream(h http.Header) bool {
 // MARK: Recording
 
 // requestMeta is what is known about a logged request before its reply: who sent it. Nil for a
-// request that is not logged (not inference, or not the Claude provider, whose replies carry
-// Anthropic's usage).
+// request that is not logged (one that spends no account).
 type requestMeta struct {
 	log                              *requestLog
 	provider, client, session, agent string
@@ -271,11 +339,8 @@ func (p *proxy) requestMeta(pl *pool, client, path string, r *http.Request, body
 	if p.requests == nil || !pl.provider.spends(path) {
 		return nil
 	}
-	if _, ok := pl.provider.(*claudeAccounts); !ok {
-		return nil
-	}
 	return &requestMeta{log: p.requests, provider: pl.provider.name(), client: client,
-		session: r.Header.Get(sessionHeader), agent: agentOf(r.UserAgent()), body: body, now: pl.now}
+		session: requestSession(r.Header), agent: agentOf(r.UserAgent()), body: body, now: pl.now}
 }
 
 // watch makes resp's body record the request once it has been relayed. A nil meta does nothing.

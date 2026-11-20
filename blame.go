@@ -96,8 +96,8 @@ func utilizationRises(records []requestRecord) (fiveHour, sevenDay []float64) {
 		return 0
 	}
 	for i, rec := range records {
-		fiveHour[i] = rise(last5, rec.Account, rec.FiveHour)
-		sevenDay[i] = rise(last7, rec.Account, rec.SevenDay)
+		fiveHour[i] = rise(last5, accountKey(rec.Provider, rec.Account), rec.FiveHour)
+		sevenDay[i] = rise(last7, accountKey(rec.Provider, rec.Account), rec.SevenDay)
 	}
 	return fiveHour, sevenDay
 }
@@ -123,7 +123,7 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 	}
 	groups := map[string]*blameRow{}
 	for i, rec := range sorted {
-		if (opts.since > 0 && rec.Time.Before(cutoff)) || (opts.account != "" && rec.Account != opts.account) {
+		if (opts.since > 0 && rec.Time.Before(cutoff)) || (opts.account != "" && accountKey(rec.Provider, rec.Account) != opts.account) {
 			continue
 		}
 		var key string
@@ -131,7 +131,7 @@ func blame(records []requestRecord, opts blameOptions, now time.Time, info func(
 		case "project":
 			key = sessionInfo(rec.Session).Project
 		case "account":
-			key = rec.Account
+			key = accountKey(rec.Provider, rec.Account)
 		case "client":
 			key = rec.Client
 		case "model":

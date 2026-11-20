@@ -505,7 +505,7 @@ func TestSecondSignInToTheSameSubscriptionIsNeverRotatedTo(t *testing.T) {
 	writeCodexLogin(t, filepath.Join(home, ".codex-work"), "work", "acct-work", time.Now().Add(time.Hour))
 	p := newPool(newCodexAccounts(home, "", ""), "http://127.0.0.1:1")
 
-	if got := p.current("c"); got == nil || got.ID != defaultID {
+	if got := p.current("c", ""); got == nil || got.ID != defaultID {
 		t.Fatalf("current = %v, want default", got)
 	}
 	if next := p.spend("c", defaultID, time.Now().Add(time.Hour)); next == nil || next.ID != "work" {

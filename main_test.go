@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -413,5 +414,117 @@ func TestALockedKeychainCostsOneTimeoutThenIsSkippedForAWhile(t *testing.T) {
 	now = now.Add(keychainBackoff + time.Second)
 	if a.now().Before(a.keychainDownUntil) {
 		t.Fatal("Keychain reads must resume after the backoff")
+	}
+}
+
+// A running session stays on its account: making another account active moves only new sessions,
+// and the running one moves when its account is spent or after it sat idle past the cache's life.
+func TestARunningSessionKeepsItsAccountUntilItIsSpent(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "t-default", "work": "t-work", "spare": "t-spare"})
+	acc := newClaudeAccounts(home, credentialsFile, "")
+	acc.claude = ""
+	p := newPool(acc, "http://127.0.0.1:1")
+	now := time.Unix(1_800_000_000, 0)
+	p.now = func() time.Time { return now }
+	on := func(session string) string {
+		t.Helper()
+		got := p.current("c", session)
+		if got == nil {
+			t.Fatalf("%s: no account", session)
+		}
+		return got.ID
+	}
+	if got := on("running"); got != defaultID {
+		t.Fatalf("running = %s", got)
+	}
+	if !p.setActive("c", "work") {
+		t.Fatal("setActive")
+	}
+	if got := on("running"); got != defaultID {
+		t.Fatalf("running moved to %s when another account was made active", got)
+	}
+	if got := on("new"); got != "work" {
+		t.Fatalf("new = %s, want work", got)
+	}
+	if got := on(""); got != "work" {
+		t.Fatalf("a request without a session = %s, want the client's active work", got)
+	}
+	p.spend("c", defaultID, now.Add(time.Hour))
+	if got := on("running"); got == defaultID {
+		t.Fatal("running stayed on its spent account")
+	}
+	running := on("running")
+	p.setActive("c", "spare")
+	now = now.Add(pinIdle - time.Minute)
+	if got := on("running"); got != running {
+		t.Fatalf("running moved to %s within the cache's life", got)
+	}
+	now = now.Add(pinIdle)
+	if got := on("running"); got != "spare" {
+		t.Fatalf("an idle session = %s, want the active spare", got)
+	}
+}
+
+func TestPinsIdlePastTheCacheLifeAreDroppedOnceThereAreMany(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "t-default"})
+	acc := newClaudeAccounts(home, credentialsFile, "")
+	acc.claude = ""
+	p := newPool(acc, "http://127.0.0.1:1")
+	now := time.Unix(1_800_000_000, 0)
+	p.now = func() time.Time { return now }
+	for i := range maxPins {
+		p.current("c", fmt.Sprint("old-", i))
+	}
+	now = now.Add(pinIdle)
+	p.current("c", "fresh")
+	if len(p.pins) != 1 {
+		t.Fatalf("%d pins kept", len(p.pins))
+	}
+}
+
+func TestEveryCacheBreakpointIsKeptForAnHour(t *testing.T) {
+	cases := map[string]string{
+		`{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]}`:                     `{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`,
+		`{"m":[{"cache_control":{"type":"ephemeral","ttl":"5m"}},{"cache_control":{"type":"ephemeral"}}]}`: `{"m":[{"cache_control":{"type":"ephemeral","ttl":"1h"}},{"cache_control":{"type":"ephemeral","ttl":"1h"}}]}`,
+		`{"m":[{"cache_control":{"type":"ephemeral","ttl":"1h"}}]}`:                                        `{"m":[{"cache_control":{"type":"ephemeral","ttl":"1h"}}]}`,
+		`{"m":[{"cache_control":{"type":"other"}}]}`:                                                       `{"m":[{"cache_control":{"type":"other"}}]}`,
+		`{"model":"x","messages":[]}`:                                                                      `{"model":"x","messages":[]}`,
+		`{"m":[{"text":"\"cache_control\":{ not json"}]}`:                                                  `{"m":[{"text":"\"cache_control\":{ not json"}]}`,
+	}
+	for in, want := range cases {
+		if got := string(cacheOneHour([]byte(in))); got != want {
+			t.Errorf("%s\n got %s\nwant %s", in, got, want)
+		}
+	}
+}
+
+// The proxy sends a Claude request with its breakpoints at an hour, on an account and on the
+// client's own login alike; a request that spends nothing goes as it came.
+func TestClaudeRequestsGoUpstreamWithTheHourCache(t *testing.T) {
+	var mu sync.Mutex
+	var bodies []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(raw))
+		mu.Unlock()
+		w.Write([]byte("{}"))
+	}))
+	t.Cleanup(up.Close)
+	home := makeHome(t, map[string]string{"default": "t-default"})
+	acc := newClaudeAccounts(home, credentialsFile, "")
+	acc.claude = ""
+	server := httptest.NewServer(newProxy(newPool(acc, up.URL)))
+	t.Cleanup(server.Close)
+	in := `{"system":[{"type":"text","text":"a","cache_control":{"type":"ephemeral"}}]}`
+	for _, path := range []string{"/v1/messages", "/api/other"} {
+		resp, err := http.Post(server.URL+path, "application/json", strings.NewReader(in))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+	if len(bodies) != 2 || !strings.Contains(bodies[0], `"ttl":"1h"`) || bodies[1] != in {
+		t.Fatalf("%q", bodies)
 	}
 }

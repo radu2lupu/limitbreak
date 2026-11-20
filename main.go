@@ -55,14 +55,19 @@ import (
 
 const (
 	// neverExpires stands for a login that states no expiry (epoch milliseconds).
-	neverExpires        = 4_000_000_000_000
-	defaultPort         = 48617
-	defaultUpstream     = "https://api.anthropic.com"
-	sharedClient        = "shared"
-	activePath          = "/_active"
-	fallbackExhaustion  = time.Hour
-	unavailableBackoff  = 5 * time.Minute
-	discoveryInterval   = 30 * time.Second
+	neverExpires       = 4_000_000_000_000
+	defaultPort        = 48617
+	defaultUpstream    = "https://api.anthropic.com"
+	sharedClient       = "shared"
+	activePath         = "/_active"
+	fallbackExhaustion = time.Hour
+	unavailableBackoff = 5 * time.Minute
+	discoveryInterval  = 30 * time.Second
+	// pinIdle is how long a session stays on its account between requests: the prompt cache's
+	// longest life (1 hour). After that its cache is gone, so moving it costs nothing.
+	pinIdle = time.Hour
+	// maxPins is the number of session pins past which idle ones are dropped.
+	maxPins             = 1000
 	defaultID           = "default"
 	spentHeader         = "Anthropic-Ratelimit-Unified-Status"
 	resetHeader         = "Anthropic-Ratelimit-Unified-Reset"
@@ -398,6 +403,9 @@ func (a *claudeAccounts) serves(string) bool { return true }
 
 func (a *claudeAccounts) spends(path string) bool { return isInference(path) }
 
+// rewrite keeps every prompt-cache breakpoint for an hour (see cacheOneHour).
+func (a *claudeAccounts) rewrite(body []byte) []byte { return cacheOneHour(body) }
+
 func (a *claudeAccounts) authorize(out *http.Request, acc account) bool {
 	token := a.token(acc)
 	if token == "" {
@@ -507,14 +515,18 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "bad request")
 		return
 	}
-	meta := p.requestMeta(pl, clientName, path, r, body)
 	if !pl.provider.spends(path) {
 		p.passThrough(w, r, pl.upstream+path, body, nil)
 		return
 	}
+	if rw, ok := pl.provider.(rewriting); ok {
+		body = rw.rewrite(body)
+	}
+	meta := p.requestMeta(pl, clientName, path, r, body)
+	session := requestSession(r.Header)
 	renewed := map[string]bool{}
 	for attempts := len(pl.list()) + 1; attempts > 0; attempts-- {
-		acc := pl.current(clientName)
+		acc := pl.current(clientName, session)
 		if acc == nil {
 			// Nothing to switch to (no login, or every account spent): the client's own login answers.
 			p.passThrough(w, r, pl.upstream+path, body, meta)
@@ -587,7 +599,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveActive answers `PUT /_c/<client>/_active` with `{"provider":"codex","id":"<account id>"}`
 // (provider defaults to the first pool's, "claude"): the client's active account for that provider
-// becomes that one (it still moves on when that account is spent). 404 for an unknown provider or id.
+// becomes that one for its new sessions (running ones stay on theirs; see pool.current), and it still
+// moves on when that account is spent. 404 for an unknown provider or id.
 func (p *proxy) serveActive(w http.ResponseWriter, r *http.Request, client string) {
 	if r.Method != http.MethodPut {
 		w.Header().Set("Allow", http.MethodPut)
@@ -748,4 +761,54 @@ func envInt(name string, fallback int) int {
 		return v
 	}
 	return fallback
+}
+
+// MARK: Prompt cache
+
+// cacheControlKey opens a cache breakpoint in a messages request body as Claude Code writes it.
+var cacheControlKey = []byte(`"cache_control":{`)
+
+// cacheOneHour is a messages request body with every prompt-cache breakpoint kept for an hour
+// (`"ttl":"1h"`) instead of 5 minutes, so a pause between turns does not cost the whole context
+// again. Claude Code already asks for an hour on a subscription's main conversation, but not for
+// subagents and background requests. A breakpoint that names another ttl is left alone; one hour on
+// every one keeps the API's rule that longer ones come first. Only the breakpoint objects change, so
+// the cached text is byte for byte the client's.
+func cacheOneHour(body []byte) []byte {
+	if !bytes.Contains(body, cacheControlKey) {
+		return body
+	}
+	out := make([]byte, 0, len(body)+64)
+	rest := body
+	for {
+		i := bytes.Index(rest, cacheControlKey)
+		if i < 0 {
+			return append(out, rest...)
+		}
+		open := i + len(cacheControlKey) - 1
+		end := bytes.IndexByte(rest[open:], '}')
+		if end < 0 {
+			return append(out, rest...)
+		}
+		obj := rest[open : open+end+1]
+		out = append(out, rest[:open]...)
+		out = append(out, oneHourBreakpoint(obj)...)
+		rest = rest[open+end+1:]
+	}
+}
+
+// oneHourBreakpoint is one `{…}` cache_control object kept for an hour: an ephemeral one with no
+// ttl or 5 minutes gets "1h"; anything else is returned as it is.
+func oneHourBreakpoint(obj []byte) []byte {
+	var cc map[string]any
+	if json.Unmarshal(obj, &cc) != nil || cc["type"] != "ephemeral" {
+		return obj
+	}
+	switch ttl, has := cc["ttl"]; {
+	case !has:
+		return append(append([]byte{}, obj[:len(obj)-1]...), []byte(`,"ttl":"1h"}`)...)
+	case ttl == "5m":
+		return bytes.Replace(obj, []byte(`"5m"`), []byte(`"1h"`), 1)
+	}
+	return obj
 }

@@ -41,6 +41,8 @@ It does the same for Codex on ChatGPT sign-ins, see [Codex](#codex), and for Gro
 - An expired token is refreshed by running one tiny `claude -p` under that account's directory, so Claude Code stays the only thing that refreshes a login.
 - If no account can serve a request, it passes through with Claude Code's own login: never worse than no proxy.
 - Only a window rejection (`429` with `anthropic-ratelimit-unified-status: rejected`) switches accounts. Ordinary rate limits go back to Claude unchanged.
+- A running session stays on the account it is on until that account is spent: the prompt cache is per account, and a move re-sends its whole context as a cache write. When the client's active account changes, only new sessions (and sessions idle for over an hour, whose cache has expired) take the new one.
+- Every prompt-cache breakpoint in a Claude request is sent with a 1-hour lifetime (`"ttl":"1h"`), so a pause of more than 5 minutes does not re-write the context. Claude Code already does this for a subscription's main conversation, not for subagents and background requests. Nothing else in the request changes.
 
 ## Install
 
@@ -93,7 +95,7 @@ To use the same tokens on another machine of yours, install limitbreak there, th
 
 ## Which sessions used the limits
 
-The proxy appends one JSON line per Claude `/v1/messages` reply to `~/.local/state/limitbreak/requests.jsonl` (mode 600): the time, client (`/_c/<client>` or `shared`), the account that answered (`own` when it went on Claude Code's own login because no account could take it), the Claude Code session id (`X-Claude-Code-Session-Id`), the agent (`sdk` or `cli`), model, status, the reply's token counts (input, cache write, cache read, output) and the 5-hour and 7-day utilization from its headers. It records no prompt or reply text and no token. A retried spent reply is not logged; the reply the client got is. Past 20 MB the file moves to `requests.jsonl.1` (replacing an older one). Codex and Grok requests are not logged.
+The proxy appends one JSON line per model reply it serves (Claude `/v1/messages`, Codex and Grok model turns) to `~/.local/state/limitbreak/requests.jsonl` (mode 600): the time, client (`/_c/<client>` or `shared`), the account that answered (`own` when it went on Claude Code's own login because no account could take it), the provider, the session id (`X-Claude-Code-Session-Id`, Codex's `session_id`, Grok's `x-grok-conv-id`), the agent (`sdk` or `cli`), model, status, the reply's token counts (input, cache write and how much of it is kept for an hour, cache read, output; Codex and Grok counts are put in the same terms, their cached input as cache read) and the 5-hour and 7-day utilization from its headers. It records no prompt or reply text and no token. A retried spent reply is not logged; the reply the client got is. Past 20 MB the file moves to `requests.jsonl.1` (replacing an older one).
 
 ```sh
 limitbreak blame                       # last 24h, by session
@@ -112,7 +114,7 @@ A session's project and title come from its transcript (`~/.claude*/projects/*/<
 
 `limitbreak backfill [--since YYYY-MM-DD|24h|7d] [--dry-run]` (default: since local midnight) rebuilds records for the replies before the log began from Claude Code's transcripts (the same dirs, subagent transcripts counted to their parent session), each reply once, and only up to the first record the proxy logged itself, so nothing counts twice. It replaces `requests.backfill.jsonl` beside the log, so it can be rerun; `blame` reads it too and marks those rows `*`. Their account is inferred from the switch log (`?` before a client's first logged switch; Hi, computer agents are their own `/_c/<client>`, everything else `shared`). A client can also move without a line of its own and a request that bypassed the proxy looks the same, so treat it as a guess; they have no 5h/7d.
 
-`GET /_usage?since=7d` (default 7d; any `--since` value) is the same for an app: every account's `/_status` entry (Claude, Codex and Grok, each with its windows) plus its weighted total over the period, its five heaviest sessions (title, project, client, weighted, whether rebuilt) and the weighted `rest`, and the totals that went on clients' own logins (`own`) and with no account recorded (`unrecorded`). Only Claude replies are logged, so Codex and Grok accounts come with their windows and no sessions. [OpenCode](#opencode)'s accounts are added after them. A report is reused for 60 seconds. Hi, computer's Usage page is drawn from it.
+`GET /_usage?since=7d` (default 7d; any `--since` value) is the same for an app: every account's `/_status` entry (Claude, Codex and Grok, each with its windows) plus its weighted total over the period, its five heaviest sessions (title, project, client, weighted, whether rebuilt) and the weighted `rest`, and the totals that went on clients' own logins (`own`) and with no account recorded (`unrecorded`). Codex and Grok accounts get their sessions too (their records are keyed `codex:<id>` and `grok:<id>`, so they never mix with a Claude account of the same id). [OpenCode](#opencode)'s accounts are added after them. A report is reused for 60 seconds. Hi, computer's Usage page is drawn from it.
 
 ## Codex
 
@@ -176,7 +178,7 @@ A request path may begin with `/_c/<client>/` to give a client (an agent, a tool
 Loopback API for apps that show accounts (JSON; fields are only ever added):
 
 - `GET /_status`: every account with `id`, `provider` (`claude`, `codex` or `grok`), `email`, `label` (the name to show: the email, else the id), `plan` (`max`, `plus`, … or empty), `spentUntil` (unix seconds or null), `activeFor` (client names), `authEnds` (unix seconds or null), `windows` and, for Claude, `usage` (the stored usage values by name, such as `seven_day_utilization`, each with `value` and `observed`). `windows` is the same for every provider: `[{"id":"five_hour","label":"5h","usedPercent":42,"resetsAt":1800000000,"windowMinutes":300,"observed":1799990000}]` (Codex: `primary`, `secondary`; Grok: `weekly`, its billing period; times in unix seconds, `resetsAt` may be null). No token is ever in it.
-- `PUT /_c/<client>/_active` with `{"provider":"codex","id":"work"}` (`provider` defaults to `claude`): that client's next request for that provider goes to `work` (it still moves on when `work` is spent). The active account is per client per provider. `404` for an unknown provider or id. Replies with the status list.
+- `PUT /_c/<client>/_active` with `{"provider":"codex","id":"work"}` (`provider` defaults to `claude`): that client's next request for that provider goes to `work` (it still moves on when `work` is spent; sessions already running stay where they are). The active account is per client per provider. `404` for an unknown provider or id. Replies with the status list.
 
 For apps, `add` and `remove` speak JSON, one event per line on stdout:
 

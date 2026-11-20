@@ -52,7 +52,7 @@ func TestBlameWeighsTokensAndRanksByTheWeightedTotal(t *testing.T) {
 	if len(rows) != 2 || rows[0].Key != "writer" || rows[0].Weighted != 111_000 || rows[1].Weighted != 105_000 || rows[1].Requests != 2 {
 		t.Fatalf("%+v", rows)
 	}
-	if weighted(tokenUsage{1, 1, 1, 1}) != 1+1.25+0.1+5 {
+	if weighted(tokenUsage{1, 1, 1, 1, 0}) != 1+1.25+0.1+5 {
 		t.Fatal("weights")
 	}
 }

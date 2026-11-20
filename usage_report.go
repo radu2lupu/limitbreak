@@ -69,7 +69,7 @@ func accountSessions(records []requestRecord, cutoff time.Time) map[string][]usa
 		if rec.Time.Before(cutoff) {
 			continue
 		}
-		k := key{cmp.Or(rec.Account, "?"), cmp.Or(rec.Session, "?")}
+		k := key{accountKey(rec.Provider, cmp.Or(rec.Account, "?")), cmp.Or(rec.Session, "?")}
 		s := sums[k]
 		if s == nil {
 			s = &usageSession{Session: k.session, Client: rec.Client}
@@ -93,8 +93,8 @@ func accountSessions(records []requestRecord, cutoff time.Time) map[string][]usa
 	return out
 }
 
-// buildUsageReport joins the accounts' status with their sessions. Only Claude replies are logged, so
-// only Claude accounts get sessions; the others are listed with none. info resolves a listed session's
+// buildUsageReport joins the accounts' status with their sessions (Claude, Codex and Grok replies are
+// logged; an account with none, such as OpenCode's, is listed with none). info resolves a listed session's
 // transcript and name a client's agent name; each is asked only for the sessions that are listed.
 func buildUsageReport(status []accountStatus, records []requestRecord, since time.Duration, now time.Time,
 	info func(session string) transcriptInfo, name func(client string) string) usageReport {
@@ -110,10 +110,7 @@ func buildUsageReport(status []accountStatus, records []requestRecord, since tim
 	report := usageReport{Since: cutoff.Unix(), Generated: now.Unix(), Accounts: []usageAccount{},
 		Own: total(bySession[ownAccount]), Unrecorded: total(bySession["?"])}
 	for _, st := range status {
-		var list []usageSession
-		if st.Provider == "claude" {
-			list = bySession[st.ID]
-		}
+		list := bySession[accountKey(st.Provider, st.ID)]
 		acc := usageAccount{accountStatus: st, Weighted: total(list), Sessions: []usageSession{}}
 		for i, s := range list {
 			if i >= usageReportSessions {

@@ -43,6 +43,11 @@ type provider interface {
 	usage(acc account) (map[string]usageValue, []usageWindow)
 }
 
+// A rewriting provider changes a spending request's body before it goes out, on any login.
+type rewriting interface {
+	rewrite(body []byte) []byte
+}
+
 // A mounted provider's upstream paths collide with another provider's (Grok's /v1/… with Claude's), so
 // clients reach it under a path prefix of its own, which comes off before the request goes upstream.
 type mounted interface {
@@ -67,11 +72,19 @@ type pool struct {
 	discoveredAt time.Time
 	active       map[string]string
 	spentUntil   map[string]time.Time
+	// pins are the account each running session is on (see current).
+	pins map[string]sessionPin
+}
+
+// sessionPin is the account a session last went out on, and when.
+type sessionPin struct {
+	account string
+	used    time.Time
 }
 
 func newPool(p provider, upstream string) *pool {
 	return &pool{provider: p, upstream: strings.TrimRight(upstream, "/"), now: time.Now,
-		active: map[string]string{}, spentUntil: map[string]time.Time{}}
+		active: map[string]string{}, spentUntil: map[string]time.Time{}, pins: map[string]sessionPin{}}
 }
 
 // list is the provider's accounts, read again at most every discoveryInterval.
@@ -125,9 +138,11 @@ func sameAs(list []account) map[string]string {
 	return dup
 }
 
-// current is the client's active account, moving on from a spent one; nil when none is signed in
-// or all are spent.
-func (p *pool) current(client string) *account {
+// current is the account a request goes out on; nil when none is signed in or all are spent. A
+// running session (its id non-empty, seen within pinIdle) stays on the account it was on until that
+// one is spent, because the prompt cache is per account and a move re-writes its whole context. A new
+// or idle session takes the client's active account, moving on from a spent one.
+func (p *pool) current(client, session string) *account {
 	list := rotation(p.list())
 	if len(list) == 0 {
 		return nil
@@ -135,17 +150,43 @@ func (p *pool) current(client string) *account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
-	want := p.active[client]
-	for i := range list {
-		if list[i].ID == want && !p.spentUntil[want].After(now) {
-			return &list[i]
+	usable := func(id string) *account {
+		for i := range list {
+			if list[i].ID == id && !p.spentUntil[id].After(now) {
+				return &list[i]
+			}
+		}
+		return nil
+	}
+	pin, pinned := p.pins[session]
+	acc := (*account)(nil)
+	if session != "" && pinned && now.Sub(pin.used) < pinIdle {
+		acc = usable(pin.account)
+	}
+	if acc == nil {
+		want := p.active[client]
+		if acc = usable(want); acc == nil {
+			if acc = nextAccount(list, want, p.spentUntil, now); acc != nil {
+				p.active[client] = acc.ID
+			}
 		}
 	}
-	usable := nextAccount(list, want, p.spentUntil, now)
-	if usable != nil {
-		p.active[client] = usable.ID
+	if acc != nil && session != "" {
+		p.pin(session, acc.ID, now)
 	}
-	return usable
+	return acc
+}
+
+// pin records the session on the account now, dropping pins idle past pinIdle once there are many.
+func (p *pool) pin(session, id string, now time.Time) {
+	if len(p.pins) >= maxPins {
+		for s, old := range p.pins {
+			if now.Sub(old.used) >= pinIdle {
+				delete(p.pins, s)
+			}
+		}
+	}
+	p.pins[session] = sessionPin{account: id, used: now}
 }
 
 // spend records the account spent until `until` (an hour when zero) and returns the next usable one.

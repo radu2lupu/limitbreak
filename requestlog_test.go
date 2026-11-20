@@ -188,7 +188,7 @@ func TestTheProxyLogsEachRepliedRequestWithItsSessionAccountTokensAndUtilization
 	}
 	r := records[0]
 	if r.Account != "default" || r.Client != "agent_a" || r.Session != "5e55-1d" || r.Agent != "sdk" || r.Provider != "claude" ||
-		r.Model != "claude-opus-4" || r.Status != 200 || r.tokenUsage != (tokenUsage{12, 300, 4000, 77}) ||
+		r.Model != "claude-opus-4" || r.Status != 200 || r.tokenUsage != (tokenUsage{12, 300, 4000, 77, 0}) ||
 		r.FiveHour == nil || *r.FiveHour != 0.37 || r.SevenDay == nil || *r.SevenDay != 0.12 || time.Since(r.Time) > time.Minute {
 		t.Fatalf("%+v", r)
 	}
@@ -259,5 +259,69 @@ func TestASpentReplyHandedBackToTheClientIsLoggedWithNoTokens(t *testing.T) {
 	records := readLog(t, home)
 	if len(records) != 1 || records[0].Status != 429 || records[0].tokenUsage != (tokenUsage{}) {
 		t.Fatalf("%+v", records)
+	}
+}
+
+// Codex and Grok replies use OpenAI's usage shapes, whose input count includes the cached part;
+// the log keeps Anthropic's terms. Anthropic's own reply also says how much it wrote for an hour.
+func TestUsageInEveryProvidersShapeIsReadInAnthropicsTerms(t *testing.T) {
+	for _, c := range []struct {
+		event string
+		model string
+		want  tokenUsage
+	}{
+		{`{"type":"response.completed","response":{"model":"gpt-6.1","usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":800},"output_tokens":50,"output_tokens_details":{"reasoning_tokens":20},"total_tokens":1050}}}`,
+			"gpt-6.1", tokenUsage{InputTokens: 200, CacheReadInputTokens: 800, OutputTokens: 50}},
+		{`{"model":"grok-5","usage":{"prompt_tokens":300,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens":7,"total_tokens":307}}`,
+			"grok-5", tokenUsage{InputTokens: 200, CacheReadInputTokens: 100, OutputTokens: 7}},
+		{`{"type":"message_start","message":{"model":"claude-x","usage":{"input_tokens":3,"cache_creation_input_tokens":500,"cache_read_input_tokens":9000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500},"output_tokens":1}}}`,
+			"claude-x", tokenUsage{InputTokens: 3, CacheCreationInputTokens: 500, CacheReadInputTokens: 9000, OutputTokens: 1, CacheWrite1hInputTokens: 500}},
+	} {
+		var tally usageTally
+		tally.apply([]byte(c.event))
+		if tally.model != c.model || tally.usage != c.want {
+			t.Errorf("%s: %s %+v", c.event, tally.model, tally.usage)
+		}
+	}
+}
+
+// Codex and Grok replies are logged too, under their provider and with their session; a report
+// keeps their accounts apart from Claude's of the same id.
+func TestCodexAndGrokRepliesAreLoggedWithTheirSession(t *testing.T) {
+	home, _ := codexHome(t)
+	rig := startCodex(t, home, nil)
+	rig.up.reply["acct-child"] = func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1\",\"usage\":{\"input_tokens\":1000,\"input_tokens_details\":{\"cached_tokens\":800},\"output_tokens\":50,\"total_tokens\":1050}}}\n\n"))
+	}
+	rig.server.Config.Handler.(*proxy).requests = newRequestLog(home)
+	req, _ := http.NewRequest("POST", rig.server.URL+"/_c/t3/backend-api/codex/responses", bytes.NewReader(zstdBody))
+	req.Header.Set("Authorization", "Bearer child-own")
+	req.Header.Set("chatgpt-account-id", "acct-child")
+	req.Header.Set("Content-Encoding", "zstd")
+	req.Header.Set("session_id", "codex-thread-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	records := readLog(t, home)
+	if len(records) != 1 {
+		t.Fatalf("%+v", records)
+	}
+	r := records[0]
+	if r.Provider != "codex" || r.Account != defaultID || r.Client != "t3" || r.Session != "codex-thread-1" || r.Model != "gpt-6.1" ||
+		r.tokenUsage != (tokenUsage{InputTokens: 200, CacheReadInputTokens: 800, OutputTokens: 50}) {
+		t.Fatalf("%+v", r)
+	}
+	claude := requestRecord{Time: r.Time, Provider: "claude", Account: defaultID, Session: "s", tokenUsage: tokenUsage{OutputTokens: 1}}
+	by := accountSessions([]requestRecord{r, claude}, r.Time.Add(-time.Minute))
+	if len(by[defaultID]) != 1 || by[defaultID][0].Session != "s" || len(by["codex:default"]) != 1 {
+		t.Fatalf("%+v", by)
+	}
+	if got := requestSession(http.Header{"X-Grok-Conv-Id": {"g-1"}}); got != "g-1" {
+		t.Fatal(got)
 	}
 }
