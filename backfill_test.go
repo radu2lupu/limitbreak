@@ -169,7 +169,7 @@ func TestBackfillCommandStopsAtTheFirstLiveRecordAndRewritesIdempotently(t *test
 	writeTranscript(t, switchLogPath(home),
 		"2026/11/14 09:30:00 claude account a spent until 2026-11-14T12:40:00+01:00 for client shared; now work")
 	newRequestLog(home).append(requestRecord{Time: time.Date(2026, 11, 14, 21, 20, 0, 0, time.UTC), Provider: "claude",
-		Client: "shared", Account: "work", Session: "live"})
+		Client: "shared", Account: "work", Session: "s1"})
 
 	var out bytes.Buffer
 	if err := backfillCommand(home, []string{"--dry-run"}, now, &out); err != nil {
@@ -210,7 +210,7 @@ func TestBackfillCommandStopsAtTheFirstLiveRecordAndRewritesIdempotently(t *test
 
 func TestBackfillWithoutLiveRecordsHasNoUpperCutoff(t *testing.T) {
 	set := replySet{"a": {Time: time.Date(2026, 11, 14, 23, 0, 0, 0, time.UTC), Client: "shared", Backfilled: true}}
-	got := backfillRecords(set, switchHistory{}, time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC), earliestLive(nil))
+	got := backfillRecords(set, switchHistory{}, time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC), earliestLive(nil), nil)
 	if len(got) != 1 || got[0].Account != "?" {
 		t.Fatalf("%+v", got)
 	}
@@ -255,5 +255,19 @@ func TestBlameMarksBackfilledRowsAndTheirRecordsDoNotMoveUtilization(t *testing.
 	raw, _ := json.Marshal(got["old"])
 	if !strings.Contains(string(raw), `"backfilled":2`) {
 		t.Fatal(string(raw))
+	}
+}
+
+func TestBackfillKeepsLaterRepliesOfSessionsTheProxyNeverSaw(t *testing.T) {
+	cutoff := time.Date(2026, 11, 14, 21, 0, 0, 0, time.UTC)
+	set := replySet{
+		"early":  {Time: cutoff.Add(-time.Hour), Client: "shared", Session: "rc"},
+		"rc":     {Time: cutoff.Add(time.Hour), Client: "shared", Session: "rc"},
+		"logged": {Time: cutoff.Add(time.Hour), Client: "shared", Session: "proxied"},
+		"none":   {Time: cutoff.Add(time.Hour), Client: "shared"},
+	}
+	got := backfillRecords(set, switchHistory{}, cutoff.Add(-24*time.Hour), cutoff, map[string]bool{"proxied": true})
+	if len(got) != 2 || got[0].Account != "?" || got[1].Session != "rc" || got[1].Account != directAccount {
+		t.Fatalf("%+v", got)
 	}
 }

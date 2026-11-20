@@ -16,3 +16,13 @@ claude() {
     ANTHROPIC_BASE_URL="http://127.0.0.1:${port}" command claude "$@"
   fi
 }
+
+# Grok Build likewise, so its turns are pooled and logged (Codex reads openai_base_url from its config).
+grok() {
+  local port="${LIMITBREAK_PORT:-48617}"
+  if curl -s -m 1 -o /dev/null "http://127.0.0.1:${port}/_status"; then
+    GROK_CLI_CHAT_PROXY_BASE_URL="${GROK_CLI_CHAT_PROXY_BASE_URL:-http://127.0.0.1:${port}/grok/v1}" command grok "$@"
+  else
+    command grok "$@"
+  fi
+}

@@ -276,6 +276,11 @@ func (a *codexAccounts) spends(path string) bool {
 	return strings.HasPrefix(path, "/backend-api/codex/")
 }
 
+// logs is only the model turns: the rest of what spends (the model list, plans) says no usage.
+func (a *codexAccounts) logs(path string) bool {
+	return strings.HasPrefix(path, "/backend-api/codex/responses")
+}
+
 // authorize keeps the client's own credentials for the default account; a named one gets its
 // login's token and account id, refreshed first when it ends within codexRefreshWithin.
 func (a *codexAccounts) authorize(out *http.Request, acc account) bool {

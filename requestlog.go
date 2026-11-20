@@ -75,7 +75,7 @@ func requestsBackfillPath(home string) string {
 // MARK: Decisions (pure)
 
 // sessionHeaders name the session a request belongs to, per client: Claude Code, Codex, Grok Build.
-var sessionHeaders = []string{sessionHeader, "Session_id", "X-Grok-Conv-Id"}
+var sessionHeaders = []string{sessionHeader, "Session_id", "Session-Id", "X-Grok-Conv-Id"}
 
 // accountKey names an account across providers in the log's reports: a Claude account by its id (as
 // records before other providers were logged have it), any other as `<provider>:<id>`, since ids
@@ -318,15 +318,31 @@ func (s *usageScanner) event(line []byte) {
 	s.tally.apply(bytes.TrimSpace(data))
 }
 
-func isEventStream(h http.Header) bool {
-	media, _, _ := mime.ParseMediaType(h.Get("Content-Type"))
-	return media == "text/event-stream"
+// isEventStream is a reply sent as an event stream: so labelled, or asked for as one (the ChatGPT
+// backend streams Codex its events as text/plain).
+func isEventStream(resp *http.Response) bool {
+	for _, h := range []string{resp.Header.Get("Content-Type"), requestAccept(resp)} {
+		if media, _, _ := mime.ParseMediaType(h); media == "text/event-stream" {
+			return true
+		}
+	}
+	return false
+}
+
+func requestAccept(resp *http.Response) string {
+	if resp.Request == nil {
+		return ""
+	}
+	return resp.Request.Header.Get("Accept")
 }
 
 // MARK: Recording
 
 // requestMeta is what is known about a logged request before its reply: who sent it. Nil for a
 // request that is not logged (one that spends no account).
+// turnLogger is a provider that logs fewer of its requests than it spends on; the others log every one.
+type turnLogger interface{ logs(path string) bool }
+
 type requestMeta struct {
 	log                              *requestLog
 	provider, client, session, agent string
@@ -337,6 +353,9 @@ type requestMeta struct {
 
 func (p *proxy) requestMeta(pl *pool, client, path string, r *http.Request, body []byte) *requestMeta {
 	if p.requests == nil || !pl.provider.spends(path) {
+		return nil
+	}
+	if l, ok := pl.provider.(turnLogger); ok && !l.logs(path) {
 		return nil
 	}
 	return &requestMeta{log: p.requests, provider: pl.provider.name(), client: client,
@@ -356,7 +375,7 @@ func (m *requestMeta) watch(resp *http.Response, accountID string) {
 	if v, ok := usageHeader(resp.Header, "seven_day_utilization"); ok {
 		rec.SevenDay = &v
 	}
-	resp.Body = newUsageScanner(resp.Body, isEventStream(resp.Header), func(t usageTally) {
+	resp.Body = newUsageScanner(resp.Body, isEventStream(resp), func(t usageTally) {
 		rec.Model, rec.tokenUsage = t.model, t.usage
 		if rec.Model == "" || rec.Session == "" {
 			model, session := requestFacts(m.body)

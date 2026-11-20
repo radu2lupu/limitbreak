@@ -29,6 +29,10 @@ const maxTranscriptLine = 16 << 20
 // unknownAccount is the account of a reply sent before its client's first logged switch.
 const unknownAccount = "?"
 
+// directAccount is the account of a reply from a session the proxy never saw, such as Remote Control,
+// which refuses any ANTHROPIC_BASE_URL but api.anthropic.com and so goes out on its own login.
+const directAccount = "direct"
+
 // switchLogPath is the service's stderr on macOS (install.sh), where the pool logs each switch.
 func switchLogPath(home string) string {
 	return filepath.Join(home, "Library", "Logs", "limitbreak.log")
@@ -166,14 +170,21 @@ func (s replySet) add(key string, rec requestRecord) {
 }
 
 // backfillRecords is the set's replies in [since, until) (no upper bound when until is zero), each
-// with the account its client was on, in time order.
-func backfillRecords(set replySet, history switchHistory, since, until time.Time) []requestRecord {
+// with the account its client was on, plus the replies at or after until of the sessions the proxy
+// never logged (live holds the ones it did), with the direct account; in time order.
+func backfillRecords(set replySet, history switchHistory, since, until time.Time, live map[string]bool) []requestRecord {
 	var out []requestRecord
 	for _, rec := range set {
-		if rec.Time.Before(since) || (!until.IsZero() && !rec.Time.Before(until)) {
+		switch {
+		case rec.Time.Before(since):
+			continue
+		case until.IsZero() || rec.Time.Before(until):
+			rec.Account = history.accountAt(rec.Client, rec.Time)
+		case rec.Session != "" && !live[rec.Session]:
+			rec.Account = directAccount
+		default:
 			continue
 		}
-		rec.Account = history.accountAt(rec.Client, rec.Time)
 		out = append(out, rec)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
@@ -386,7 +397,11 @@ func backfillCommand(home string, args []string, now time.Time, out io.Writer) e
 			fmt.Fprintf(out, "skipped %s: %v\n", tildePath(home, path), err)
 		}
 	}
-	records := backfillRecords(set, history, since, cutoff)
+	seen := map[string]bool{}
+	for _, rec := range live {
+		seen[rec.Session] = true
+	}
+	records := backfillRecords(set, history, since, cutoff, seen)
 	summary := backfillSummary(records, since, cutoff)
 	if *dryRun {
 		fmt.Fprintln(out, "dry run:", summary)

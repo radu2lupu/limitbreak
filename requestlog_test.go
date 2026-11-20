@@ -291,7 +291,7 @@ func TestCodexAndGrokRepliesAreLoggedWithTheirSession(t *testing.T) {
 	home, _ := codexHome(t)
 	rig := startCodex(t, home, nil)
 	rig.up.reply["acct-child"] = func(w http.ResponseWriter) {
-		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8") // as the ChatGPT backend sends it
 		w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-6.1\",\"usage\":{\"input_tokens\":1000,\"input_tokens_details\":{\"cached_tokens\":800},\"output_tokens\":50,\"total_tokens\":1050}}}\n\n"))
 	}
 	rig.server.Config.Handler.(*proxy).requests = newRequestLog(home)
@@ -299,13 +299,21 @@ func TestCodexAndGrokRepliesAreLoggedWithTheirSession(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer child-own")
 	req.Header.Set("chatgpt-account-id", "acct-child")
 	req.Header.Set("Content-Encoding", "zstd")
-	req.Header.Set("session_id", "codex-thread-1")
+	req.Header.Set("Session-Id", "codex-thread-1") // Codex 0.171
+	req.Header.Set("Accept", "text/event-stream")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	// The model list is spent on the account but says no usage, so it is not logged.
+	list, _ := http.NewRequest("GET", rig.server.URL+"/_c/t3/backend-api/codex/models?client_version=1", nil)
+	list.Header.Set("Authorization", "Bearer child-own")
+	if resp, err := http.DefaultClient.Do(list); err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
 
 	records := readLog(t, home)
 	if len(records) != 1 {
