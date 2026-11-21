@@ -64,11 +64,14 @@ func fingerprint(raw []byte) string {
 // MARK: State
 
 // syncEntry is what was true when a login was last synced: Coffer's version of it and its fingerprint.
-// An ignored entry is an account this Mac opted out of (limitbreak unshare).
+// An ignored entry is an account this Mac opted out of (limitbreak unshare). Default says this Mac is the
+// owner of the login: its local copy is the provider's default dir (~/.grok, ~/.codex), not
+// ~/.<provider>-<name> as on every other Mac (limitbreak share default --as <name>).
 type syncEntry struct {
 	Version     int64  `json:"version,omitempty"`
 	Fingerprint string `json:"fingerprint,omitempty"`
 	Ignored     bool   `json:"ignored,omitempty"`
+	Default     bool   `json:"default,omitempty"`
 }
 
 // syncState is the entries by Coffer path. A path with a live entry is a synced account.
@@ -116,12 +119,25 @@ func writeFileAtomic(dir, name string, raw []byte) error {
 	return os.Rename(f.Name(), filepath.Join(dir, name))
 }
 
-// syncedAccounts is the provider's accounts kept in step with Coffer on this Mac, by account name.
-func syncedAccounts(home, provider string) map[string]bool {
-	out := map[string]bool{}
+// syncedEntries is the provider's logins kept in step with Coffer on this Mac, by Coffer name.
+func syncedEntries(home, provider string) map[string]syncEntry {
+	out := map[string]syncEntry{}
 	prefix := cofferLoginRoot + "/" + provider + "/"
 	for path, e := range readSyncState(home) {
 		if name, ok := strings.CutPrefix(path, prefix); ok && !e.Ignored && !strings.Contains(name, "/") {
+			out[name] = e
+		}
+	}
+	return out
+}
+
+// syncedAccounts is the provider's copies of another Mac's logins on this Mac, by account name: what
+// /_status reports as shared. The login this Mac owns (its default dir, published under a name) is not
+// one: it is the Mac's own sign-in.
+func syncedAccounts(home, provider string) map[string]bool {
+	out := map[string]bool{}
+	for name, e := range syncedEntries(home, provider) {
+		if !e.Default {
 			out[name] = true
 		}
 	}
@@ -136,6 +152,9 @@ type syncKind struct {
 	provider string
 	// prefix is the login dirs' name prefix in the home dir (".grok-").
 	prefix string
+	// defaultDir is the provider's own login dir in the home dir (".grok"); empty when its default
+	// login cannot be published (Claude's lives in the Keychain).
+	defaultDir string
 	// within is how much token life triggers a refresh when a request needs the login; ahead is how much
 	// triggers one in the sync loop. Zero for a login nobody refreshes (a Claude 1-year token).
 	within, ahead time.Duration
@@ -235,7 +254,7 @@ func loginKinds(claude *claudeAccounts, validate tokenValidator) []syncKind {
 			},
 		},
 		{
-			provider: "codex", prefix: ".codex-", within: codexRefreshWithin, ahead: codexRefreshWithin,
+			provider: "codex", prefix: ".codex-", defaultDir: ".codex", within: codexRefreshWithin, ahead: codexRefreshWithin,
 			read: func(acc account) ([]byte, bool) {
 				raw, err := os.ReadFile(authJSON(acc))
 				if _, perr := codexReal(raw); err != nil || perr != nil {
@@ -253,7 +272,7 @@ func loginKinds(claude *claudeAccounts, validate tokenValidator) []syncKind {
 			shareable: func(raw []byte, _ time.Time) error { _, err := codexReal(raw); return err },
 		},
 		{
-			provider: "grok", prefix: ".grok-", within: grokRefreshWithin, ahead: grokRefreshAhead,
+			provider: "grok", prefix: ".grok-", defaultDir: ".grok", within: grokRefreshWithin, ahead: grokRefreshAhead,
 			read: func(acc account) ([]byte, bool) {
 				raw, err := os.ReadFile(authJSON(acc))
 				if _, perr := grokReal(raw); err != nil || perr != nil {
@@ -324,13 +343,35 @@ func (s *loginSyncer) kind(provider string) (syncKind, bool) {
 	return syncKind{}, false
 }
 
-func (s *loginSyncer) account(k syncKind, name string) account {
+// accountFor is where this Mac keeps the login synced as name: the provider's default dir when the entry
+// says this Mac owns it, else ~/.<provider>-<name>. A Mac never installs into its default dir otherwise.
+func (s *loginSyncer) accountFor(k syncKind, name string, e syncEntry) account {
+	if e.Default && k.defaultDir != "" {
+		dir := filepath.Join(s.home, k.defaultDir)
+		return account{ID: defaultID, Dir: dir, Path: dir}
+	}
 	dir := filepath.Join(s.home, k.prefix+name)
 	return account{ID: name, Dir: dir, Path: dir}
 }
 
+func (s *loginSyncer) account(k syncKind, name string) account {
+	return s.accountFor(k, name, readSyncState(s.home)[loginPath(k.provider, name)])
+}
+
+// syncedNameFor is the Coffer name of the synced login that lives in dir on this Mac.
+func (s *loginSyncer) syncedNameFor(k syncKind, dir string) (string, bool) {
+	for name, e := range syncedEntries(s.home, k.provider) {
+		if s.accountFor(k, name, e).Dir == dir {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// record stores what was synced for path. The entry keeps saying this Mac owns the login once it does.
 func (s *loginSyncer) record(path string, e syncEntry) error {
 	st := readSyncState(s.home)
+	e.Default = e.Default || st[path].Default
 	st[path] = e
 	return writeSyncState(s.home, st)
 }
@@ -423,16 +464,26 @@ func (s *loginSyncer) writeBack(path string, local []byte, fp string, expect int
 }
 
 // publish is `limitbreak share`: this Mac's named login goes into Coffer (only when Coffer has none of
-// that name yet) and is then kept in step. A name Coffer already tracks here is just synced.
-func (s *loginSyncer) publish(k syncKind, name string) (string, error) {
+// that name yet) and is then kept in step. A name Coffer already tracks here is just synced. With
+// asDefault the login is this Mac's default one (~/.grok, ~/.codex), published under name; this Mac then
+// owns it: other Macs install it as ~/.<provider>-<name>, this one never moves it out of the default dir.
+func (s *loginSyncer) publish(k syncKind, name string, asDefault bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !syncableName(name) {
-		return "", fmt.Errorf("%q cannot be shared: only named accounts are (sign it in under a name: limitbreak add --provider %s <name>)", name, k.provider)
+		return "", fmt.Errorf("%q cannot be shared: only named accounts are (sign it in under a name: limitbreak add --provider %s <name>, or publish the default login under a name: limitbreak share default --as <name> --provider %s)", name, k.provider, k.provider)
 	}
 	path := loginPath(k.provider, name)
+	if asDefault {
+		if err := s.checkDefaultShare(k, name); err != nil {
+			return "", err
+		}
+	}
 	if e, ok := readSyncState(s.home)[path]; ok {
 		if !e.Ignored {
+			if e.Default != asDefault {
+				return "", fmt.Errorf("%s/%s is already synced on this Mac with its login in %s; unshare it first to change that", k.provider, name, s.accountFor(k, name, e).Path)
+			}
 			return s.syncLocked(k, name)
 		}
 		st := readSyncState(s.home)
@@ -441,8 +492,11 @@ func (s *loginSyncer) publish(k syncKind, name string) (string, error) {
 			return "", err
 		}
 	}
-	acc := s.account(k, name)
+	acc := s.accountFor(k, name, syncEntry{Default: asDefault})
 	local, ok := k.read(acc)
+	if !ok && asDefault {
+		return "", fmt.Errorf("%w: no %s login in %s", errNothingToShare, k.provider, acc.Path)
+	}
 	if !ok {
 		action, err := s.syncLocked(k, name) // none here: install Coffer's, when it has one
 		if err == nil && action == actionAbsent {
@@ -463,13 +517,32 @@ func (s *loginSyncer) publish(k syncKind, name string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return "published", s.record(path, syncEntry{Version: v, Fingerprint: fingerprint(local)})
+		return "published", s.record(path, syncEntry{Version: v, Fingerprint: fingerprint(local), Default: asDefault})
 	case err != nil:
 		return "", err
 	case fingerprint(remote) == fingerprint(local):
-		return "already in Coffer; now kept in step", s.record(path, syncEntry{Version: version, Fingerprint: fingerprint(local)})
+		return "already in Coffer; now kept in step", s.record(path, syncEntry{Version: version, Fingerprint: fingerprint(local), Default: asDefault})
 	}
 	return "", fmt.Errorf("Coffer already holds a different %s login named %s; remove one of them first", k.provider, name)
+}
+
+// checkDefaultShare refuses to publish this Mac's default login under name when that would put one login
+// in two dirs here: a named dir of that name that holds a login, or another name already owning the
+// default dir.
+func (s *loginSyncer) checkDefaultShare(k syncKind, name string) error {
+	if k.defaultDir == "" {
+		return fmt.Errorf("a %s default login cannot be published; sign it in under a name (limitbreak add --provider %s <name>)", k.provider, k.provider)
+	}
+	if _, ok := k.read(s.accountFor(k, name, syncEntry{})); ok {
+		return fmt.Errorf("%s already holds a %s login: two copies of one login on this Mac would spend the same refresh token; remove one first",
+			s.accountFor(k, name, syncEntry{}).Path, k.provider)
+	}
+	for other, e := range syncedEntries(s.home, k.provider) {
+		if e.Default && other != name {
+			return fmt.Errorf("this Mac's default %s login is already published as %s", k.provider, other)
+		}
+	}
+	return nil
 }
 
 // errNothingToShare marks an account with no shareable login, which sharing all accounts skips.
@@ -513,7 +586,7 @@ func (s *loginSyncer) tick() []syncResult {
 				names[name] = true
 			}
 		}
-		for name := range syncedAccounts(s.home, k.provider) {
+		for name := range syncedEntries(s.home, k.provider) {
 			names[name] = true
 		}
 		sorted := make([]string, 0, len(names))
@@ -606,8 +679,8 @@ func (s *loginSyncer) guard(provider string, real func(dir string) error) func(d
 	}
 	s.refresh[provider] = real
 	return func(dir string) error {
-		name := strings.TrimPrefix(filepath.Base(dir), k.prefix)
-		if filepath.Join(s.home, k.prefix+name) != dir || !syncableName(name) || !syncedAccounts(s.home, provider)[name] {
+		name, ok := s.syncedNameFor(k, dir)
+		if !ok {
 			return real(dir)
 		}
 		return s.refreshGuarded(k, name, k.within, real)
@@ -624,7 +697,7 @@ func (s *loginSyncer) renewDue() []syncResult {
 			continue
 		}
 		names := make([]string, 0)
-		for name := range syncedAccounts(s.home, k.provider) {
+		for name := range syncedEntries(s.home, k.provider) {
 			names = append(names, name)
 		}
 		sort.Strings(names)

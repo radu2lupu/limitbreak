@@ -1,6 +1,6 @@
 # Logins from Coffer
 
-Status: implemented and tested on branch `logins-from-coffer` (Limit Break and Coffer), not pushed, not deployed. Admin steps below are the owner's; none has been run.
+Status: implemented and tested on branch `logins-from-coffer` (Limit Break and Coffer). Coffer with the conditional put is deployed; identities and rules exist; the Claude logins are published and synced. The default Grok and Codex logins are published by the main session with `share default --as` (rollout order below).
 Decided by Radu, 2026-11-21: "each device should have its own limitbreak running. And they should access the
 creds from coffer or somethng."
 
@@ -20,7 +20,7 @@ Coffer is the one shared store of provider logins. Each Mac keeps a local copy i
 already uses and keeps working when Coffer is unreachable.
 
 **Paths.** `limitbreak/<provider>/<account>` holds the login (provider `claude`, `codex` or `grok`; account is
-a named account, never the default one). `limitbreak/lease/<provider>/<account>` holds the refresh lease.
+a named account; a Mac's default login is published under a name, see "A default login"). `limitbreak/lease/<provider>/<account>` holds the refresh lease.
 
 **Value.** Grok and Codex: the provider's own `auth.json`, whole, refresh token included (Coffer is the place a
 refresh token may live). Claude: the 1-year token record (`{token, expiresAt, createdAt}`); a Claude sign-in's
@@ -81,6 +81,15 @@ one run against a real Coffer built from the branch in a temp dir.
 service `coffer.limitbreak`, account `token`. No address or no token: sync is off and Limit Break behaves as a
 Mac with no Coffer.
 
+## A default login
+
+The owner signs a provider in on the laptop as the default account (`~/.grok`, `~/.codex`) and must not have to sign in again under a name. `limitbreak share default --as <name> --provider grok|codex` publishes that dir under `limitbreak/<provider>/<name>`:
+
+- The state entry for that path gets `default: true`: on **this** Mac the local copy is the default dir, so install, write-back, the lease-guarded refresh (`guard` finds the account by dir) and the sync loop's proactive refresh all use `~/.grok`/`~/.codex`. Every other Mac has no such flag and installs `~/.<provider>-<name>`. No Mac installs a Coffer login into its own default dir unless its own state says `default`.
+- `/_status` and `syncedAccounts` count only non-default entries as `shared`, so the owner's default stays the default account and the other Macs show `shared: true` as before.
+- Refused: no login in the default dir; `~/.<provider>-<name>` already holds a login (two copies would spend one refresh token); the default is already published under another name; Claude (its default login is in the Keychain, not a dir); and `--as` anywhere but `share default`.
+- `unshare <name>` on the owner stops tracking and leaves `~/.grok` as it is; `share default --as <name>` again re-tracks it when Coffer holds the same login.
+
 ## Failure modes
 
 | What breaks | Result |
@@ -90,6 +99,7 @@ Mac with no Coffer.
 | Two Macs both write back | One wins the CAS; the other reads again and installs the winner's login. |
 | Clock skew above the lease TTL | Two Macs may refresh at once; the second write-back conflicts and the first login wins. |
 | Coffer rule missing | 403: that Mac installs and publishes nothing; `limitbreak sync` prints the reason. |
+| A CLI refreshes the default dir outside the lease | grok/codex may refresh `~/.grok`/`~/.codex` on their own. The next pass sees a local change and writes it back with the compare-and-swap; if another Mac also moved the login the later token end wins. Limit Break's proactive refresh (Grok under 3 h, Codex under 24 h) comes before the CLIs' own threshold and holds the lease, so this is rare. The residual risk is a Mac spending an old refresh token in the minutes before the next pass; recovery is the same sign-in as for a crash. |
 | Account removed in Coffer | The local copy stays and keeps being tracked; nothing is pushed back. |
 
 ## Verification
@@ -131,11 +141,15 @@ Mini as `_coffer`; `IP_<mac>` is that Mac's tailnet IP.
        --subject "limitbreak@$m" --pattern 'limitbreak/*' --ops read,write,list --ip "$(eval echo \$IP_$m)"
    done
    ```
-4. **First import of each existing login.** A login must be a *named* account (`~/.grok-<name>`,
-   `~/.codex-<name>`, `~/.claude-<name>`). The default `~/.grok` and `~/.codex` belong to the tools themselves;
-   copying one to a named dir would give two homes the same refresh token, so sign the account in under a name
-   (`limitbreak add --provider grok <name>`) on one Mac, then publish it from that Mac with the Mac's own
-   identity (no admin write needed):
+4. **First import of each existing login**, published from the Mac that holds it with that Mac's own
+   identity (no admin write needed). The laptop's default Grok and Codex (new CLI binary):
+
+   ```sh
+   limitbreak share --provider grok default --as radu2lupu
+   limitbreak share --provider codex default --as radu2lupu   # a different name if the Codex email differs
+   ```
+
+   A named dir (`~/.grok-<name>`, `~/.codex-<name>`, `~/.claude-<name>`) is published without `default`:
 
    ```sh
    limitbreak share --provider grok <name>     # likewise --provider codex, and claude after `limitbreak renew <name>`
@@ -151,5 +165,22 @@ Mini as `_coffer`; `IP_<mac>` is that Mac's tailnet IP.
    (there is no `coffer delete` command). A delete is a tombstone version, so a later conditional publish of the same
    path conflicts for ever: put it again with the unconditional admin `coffer put` (step 4's second form), after
    which the Macs track it as any other version.
-6. Remove the SSH pushes' leftovers on each Mac when convenient: `~/.local/state/limitbreak/grok-shares.json`
-   and any `~/.grok-shared` that was only a pushed copy.
+6. **The Mini's Grok** (`~/.grok-shared`, an SSH-pushed token-only copy that the app reads through `/_status`).
+   Chosen: the owner publishes its default Grok as `radu2lupu`, and the Mini installs it as `~/.grok-radu2lupu`
+   (a real name, not `shared`). `shared` would collide with the Mini's untracked `~/.grok-shared`, which the sync
+   refuses to overwrite ("holds a login of its own that differs"), and the app reads `shared: true` and
+   `tokenEnds` from whichever account is synced, so `/_status` keeps its shape. Rollout order, so the Mini's Grok
+   never has no valid login:
+   1. Laptop, new CLI binary: `limitbreak share --provider grok default --as radu2lupu`. The laptop and the Mini
+      now hold the same rotating refresh token, so do step 2 at once.
+   2. Replace the laptop's serving binary (its loop then writes back every refresh). The SSH push to
+      `~/.grok-shared` stops here; its token ends 2026-11-21 23:37 CET and is still valid meanwhile.
+   3. Replace the Mini's serving binary, or run `limitbreak sync` there first: it installs `~/.grok-radu2lupu`
+      with a fresh login. Check `/_status` shows it with `shared: true` and a `tokenEnds` in the future. The
+      Mini does not refresh for hours on a fresh token.
+   4. Only then remove the Mini's `~/.grok-shared` and `~/.local/state/limitbreak/grok-shares.json`; any client
+      the app pointed at `shared` follows the new account by `/_status`.
+   Residual risk: until step 2 the laptop's CLI may refresh outside Coffer's view; the next pass writes it back
+   (later token end wins).
+7. Remove the SSH pushes' leftovers on each other Mac when convenient (`grok-shares.json`, a `~/.grok-shared`
+   that was only a pushed copy).

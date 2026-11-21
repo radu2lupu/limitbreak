@@ -151,7 +151,7 @@ func (m *mac) token(name string) string {
 
 func (m *mac) mustPublish(name string) {
 	m.t.Helper()
-	if action, err := m.s.publish(m.grokKind(), name); err != nil || action != "published" {
+	if action, err := m.s.publish(m.grokKind(), name, false); err != nil || action != "published" {
 		m.t.Fatalf("publish %s: %q %v", name, action, err)
 	}
 }
@@ -402,16 +402,16 @@ func TestOnlyANamedLoginWithItsRefreshTokenIsPublished(t *testing.T) {
 	clock, store := time.Now(), newFakeCoffer()
 	a := newMac(t, store, "a", &clock)
 	k := a.grokKind()
-	if _, err := a.s.publish(k, defaultID); err == nil {
+	if _, err := a.s.publish(k, defaultID, false); err == nil {
 		t.Fatal("published the default account")
 	}
 	noRefresh, _ := dropRefreshToken(grokAuthJSON("work", clock.Add(time.Hour)))
 	os.MkdirAll(a.dir("work"), 0o700)
 	os.WriteFile(filepath.Join(a.dir("work"), "auth.json"), noRefresh, 0o600)
-	if _, err := a.s.publish(k, "work"); !errors.Is(err, errNothingToShare) {
+	if _, err := a.s.publish(k, "work", false); !errors.Is(err, errNothingToShare) {
 		t.Fatal(err)
 	}
-	if _, err := a.s.publish(k, "nobody"); !errors.Is(err, errNothingToShare) {
+	if _, err := a.s.publish(k, "nobody", false); !errors.Is(err, errNothingToShare) {
 		t.Fatal(err)
 	}
 	if len(store.data) != 0 {
@@ -429,13 +429,13 @@ func TestPublishingWhatCofferAlreadyHoldsTracksItAndADifferentOneIsRefused(t *te
 	os.MkdirAll(b.dir("work"), 0o700)
 	os.WriteFile(filepath.Join(b.dir("work"), "auth.json"), mustReadFile(t, filepath.Join(a.dir("work"), "auth.json")), 0o600)
 	puts := store.puts
-	if action, err := b.s.publish(b.grokKind(), "work"); err != nil || !strings.Contains(action, "already in Coffer") || store.puts != puts {
+	if action, err := b.s.publish(b.grokKind(), "work", false); err != nil || !strings.Contains(action, "already in Coffer") || store.puts != puts {
 		t.Fatal(action, err)
 	}
 	// A different one under that name is refused.
 	writeGrokLogin(t, b.dir("other"), "other", clock.Add(5*time.Hour))
 	store.putIf("limitbreak/grok/other", []byte("{}"), 0)
-	if _, err := b.s.publish(b.grokKind(), "other"); err == nil {
+	if _, err := b.s.publish(b.grokKind(), "other", false); err == nil {
 		t.Fatal("overwrote Coffer's login")
 	}
 }
@@ -465,12 +465,12 @@ func TestUnshareStopsTheSyncAndShareStartsItAgain(t *testing.T) {
 	}
 	store.down = false
 	// Sharing again while B's login differs from Coffer's is refused: neither side is overwritten.
-	if _, err := b.s.publish(b.grokKind(), "work"); err == nil || syncedAccounts(b.home, "grok")["work"] {
+	if _, err := b.s.publish(b.grokKind(), "work", false); err == nil || syncedAccounts(b.home, "grok")["work"] {
 		t.Fatal("shared a login that differs from Coffer's:", err)
 	}
 	// With Coffer's own login in place it is tracked again.
 	os.WriteFile(filepath.Join(b.dir("work"), "auth.json"), mustReadFile(t, filepath.Join(a.dir("work"), "auth.json")), 0o600)
-	if action, err := b.s.publish(b.grokKind(), "work"); err != nil || action == actionIgnored || !syncedAccounts(b.home, "grok")["work"] {
+	if action, err := b.s.publish(b.grokKind(), "work", false); err != nil || action == actionIgnored || !syncedAccounts(b.home, "grok")["work"] {
 		t.Fatal(action, err)
 	}
 }
@@ -623,13 +623,13 @@ func TestAClaudeTokenIsPublishedFromANamedAccountOnly(t *testing.T) {
 	s := newLoginSyncer(home, store, loginKinds(claude, nil))
 	s.now = func() time.Time { return clock }
 	k, _ := s.kind("claude")
-	if _, err := s.publish(k, defaultID); err == nil {
+	if _, err := s.publish(k, defaultID, false); err == nil {
 		t.Fatal("published the default account's token")
 	}
-	if action, err := s.publish(k, "founder"); err != nil || action != "published" {
+	if action, err := s.publish(k, "founder", false); err != nil || action != "published" {
 		t.Fatal(action, err)
 	}
-	if _, err := s.publish(k, "nokey"); !errors.Is(err, errNothingToShare) {
+	if _, err := s.publish(k, "nokey", false); !errors.Is(err, errNothingToShare) {
 		t.Fatal(err)
 	}
 	if got := s.localNames(k); strings.Join(got, ",") != "founder,nokey" {
@@ -655,7 +655,7 @@ func TestACodexLoginIsSyncedLikeAGrokOne(t *testing.T) {
 	auth := mustJSON(map[string]any{"auth_mode": "chatgpt", "tokens": map[string]any{
 		"access_token": fakeJWT(map[string]any{"exp": clock.Add(48 * time.Hour).Unix()}), "refresh_token": "r", "account_id": "acct"}})
 	os.WriteFile(filepath.Join(dir, "auth.json"), auth, 0o600)
-	if action, err := a.publish(k, "work"); err != nil || action != "published" {
+	if action, err := a.publish(k, "work", false); err != nil || action != "published" {
 		t.Fatal(action, err)
 	}
 	res := b.tick()
@@ -759,14 +759,20 @@ func TestCofferIsConfiguredByEnvironmentOrFileAndOffWithoutBoth(t *testing.T) {
 	}
 }
 
-func TestShareAndSyncCommandsRunAgainstTheConfiguredCoffer(t *testing.T) {
-	store := newFakeCoffer()
+// setCofferEnv points this process's Coffer configuration at a fake Coffer for the CLI commands.
+func setCofferEnv(t *testing.T, store *fakeCoffer) {
+	t.Helper()
 	srv := httptest.NewServer(store.handler("tok"))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 	tokenFile := filepath.Join(t.TempDir(), "token")
 	os.WriteFile(tokenFile, []byte("tok"), 0o600)
 	t.Setenv(cofferAddrEnv, srv.URL)
 	t.Setenv(cofferTokenFileEnv, tokenFile)
+}
+
+func TestShareAndSyncCommandsRunAgainstTheConfiguredCoffer(t *testing.T) {
+	store := newFakeCoffer()
+	setCofferEnv(t, store)
 
 	owner, other := t.TempDir(), t.TempDir()
 	writeGrokLogin(t, filepath.Join(owner, ".grok-work"), "work", time.Now().Add(5*time.Hour))

@@ -26,6 +26,9 @@ limitbreak renew [name...] [--all]
 limitbreak share [name...] [--provider claude|codex|grok]
                                 put this Mac's named logins (all, or the named ones) in Coffer and keep
                                 them in step with it (a Claude login is its 1-year token)
+limitbreak share default --as <name> --provider codex|grok
+                                put this Mac's own default login (~/.codex, ~/.grok) in Coffer as <name>;
+                                this Mac keeps it in its default dir, other Macs install ~/.<provider>-<name>
 limitbreak unshare [name...] [--provider P]
                                 stop syncing those logins on this Mac
 limitbreak sync                 one pass against Coffer now (serve runs one every 5 minutes): install new
@@ -983,11 +986,19 @@ func syncerFor(home string) (*loginSyncer, error) {
 }
 
 // shareCommand runs share or unshare for the provider named by --provider (claude by default): the
-// named accounts, or with none every named account of the provider on this Mac.
+// named accounts, or with none every named account of the provider on this Mac. `share default --as <name>`
+// publishes this Mac's default login under name and keeps it in the default dir.
 func shareCommand(command, home string, args []string, out io.Writer) error {
 	provider, _, names, err := accountFlags(args)
 	if err != nil {
 		return err
+	}
+	var as string
+	if names, as, err = takeAsFlag(names); err != nil {
+		return err
+	}
+	if as != "" && (command != "share" || len(names) != 1 || names[0] != defaultID) {
+		return fmt.Errorf("--as goes with %q only: limitbreak share default --as <name> --provider <codex|grok>", defaultID)
 	}
 	s, err := syncerFor(home)
 	if err != nil {
@@ -996,6 +1007,14 @@ func shareCommand(command, home string, args []string, out io.Writer) error {
 	k, ok := s.kind(provider)
 	if !ok {
 		return fmt.Errorf("share works for claude, codex and grok, not %q", provider)
+	}
+	if as != "" {
+		action, err := s.publish(k, as, true)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s/%s (this Mac's default login): %s\n", provider, as, action)
+		return nil
 	}
 	all := len(names) == 0
 	if all {
@@ -1013,7 +1032,7 @@ func shareCommand(command, home string, args []string, out io.Writer) error {
 			fmt.Fprintf(out, "%s/%s: no longer synced on this Mac (Coffer's copy and the local one stay).\n", provider, name)
 			continue
 		}
-		action, err := s.publish(k, name)
+		action, err := s.publish(k, name, false)
 		switch {
 		case errors.Is(err, errNothingToShare) && all:
 			fmt.Fprintf(out, "%s/%s: skipped: %v\n", provider, name, err)
@@ -1028,6 +1047,25 @@ func shareCommand(command, home string, args []string, out io.Writer) error {
 		return fmt.Errorf("not shared: %s", strings.Join(failed, ", "))
 	}
 	return nil
+}
+
+// takeAsFlag removes --as <name> (or --as=<name>) from args.
+func takeAsFlag(args []string) (rest []string, as string, err error) {
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; {
+		case arg == "--as":
+			if i+1 >= len(args) {
+				return nil, "", errors.New("--as needs a name")
+			}
+			i++
+			as = args[i]
+		case strings.HasPrefix(arg, "--as="):
+			as = strings.TrimPrefix(arg, "--as=")
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return rest, as, nil
 }
 
 // syncNowCommand is `limitbreak sync`: one pass against this Mac's Coffer.
