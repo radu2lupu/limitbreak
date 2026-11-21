@@ -954,11 +954,22 @@ func openBrowser(link string) int {
 // remoteImport sends one account's token record to `limitbreak import-token` on an SSH host.
 type remoteImport func(host, id string, record []byte) (string, error)
 
-func sshImport(host, id string, record []byte) (string, error) {
-	cmd := exec.Command("ssh", host, `"$HOME/.local/bin/limitbreak" import-token `+shellQuote(id))
-	cmd.Stdin = bytes.NewReader(record)
+// sshStdin runs a command on an SSH host with stdin as its input (secrets go this way, never in
+// argv) and returns its output. opts are ssh options (for an unattended caller: BatchMode,
+// ConnectTimeout).
+func sshStdin(host, remote string, stdin []byte, opts ...string) (string, error) {
+	args := []string{}
+	for _, o := range opts {
+		args = append(args, "-o", o)
+	}
+	cmd := exec.Command("ssh", append(args, host, remote)...)
+	cmd.Stdin = bytes.NewReader(stdin)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
+}
+
+func sshImport(host, id string, record []byte) (string, error) {
+	return sshStdin(host, `"$HOME/.local/bin/limitbreak" import-token `+shellQuote(id), record)
 }
 
 // shareTokens copies the unexpired 1-year token of every account, or of the accounts named after
