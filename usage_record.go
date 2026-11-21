@@ -31,7 +31,7 @@ var usageHeaders = map[string]string{
 }
 
 func usagePath(home string) string {
-	return filepath.Join(home, ".local", "state", "limitbreak", "usage.json")
+	return stateFile(home, "usage.json")
 }
 func readUsage(home string) (map[string]usageRecord, error) {
 	records := map[string]usageRecord{}

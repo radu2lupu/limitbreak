@@ -2,8 +2,8 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -24,17 +23,16 @@ limitbreak add [name]           sign in a new account (opens the browser)
 limitbreak list                 show the accounts and when each one's login ends
 limitbreak renew [name...] [--all]
                                 give accounts a 1-year token (one browser authorization each)
-limitbreak share <ssh-host> [name...]
-                                copy the 1-year tokens (all, or the named accounts) to the same-named
-                                accounts on another machine
-limitbreak share <ssh-host> [name...] --provider grok
-                                give another Mac a token-only copy of this Mac's Grok login (no refresh
-                                token) and keep it fresh while limitbreak serve runs
-limitbreak unshare <ssh-host> [name...] --provider grok
-                                stop keeping that Mac's copy fresh
+limitbreak share [name...] [--provider claude|codex|grok]
+                                put this Mac's named logins (all, or the named ones) in Coffer and keep
+                                them in step with it (a Claude login is its 1-year token)
+limitbreak unshare [name...] [--provider P]
+                                stop syncing those logins on this Mac
+limitbreak sync                 one pass against Coffer now (serve runs one every 5 minutes): install new
+                                logins, take newer ones, write local changes back
 limitbreak grok-placeholder <dir>
                                 put the stand-in auth.json in a Grok home so grok starts there with no
-                                sign-in (Limit Break swaps in the shared login on every request)
+                                sign-in (Limit Break swaps in the synced login on every request)
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client|model] [--json]
                                 which sessions used the limits (from the request log)
@@ -78,13 +76,11 @@ func runCommand(command string, args []string) int {
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
 	case "share", "unshare":
-		err = shareCommand(command, a, newGrokAccounts(home, "", envString("LIMITBREAK_GROK_UPSTREAM", defaultGrokUpstream)), args)
-	case "import-grok":
-		err = importGrok(newGrokAccounts(home, "", ""), args, os.Stdin, os.Stdout)
+		err = shareCommand(command, home, args, os.Stdout)
+	case "sync":
+		err = syncNowCommand(home, os.Stdout)
 	case "grok-placeholder":
 		err = grokPlaceholderCommand(args, os.Stdout)
-	case "import-token":
-		err = importToken(a, args, countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdin, os.Stdout)
 	default:
 		fmt.Fprintln(os.Stderr, usage)
 		return 2
@@ -960,122 +956,8 @@ func openBrowser(link string) int {
 
 // MARK: Share
 
-// A 1-year token is a plain bearer token that never rotates, so unlike a sign-in it can be copied
-// to another machine without the two logging each other out.
-
-// remoteImport sends one account's token record to `limitbreak import-token` on an SSH host.
-type remoteImport func(host, id string, record []byte) (string, error)
-
-// sshStdin runs a command on an SSH host with stdin as its input (secrets go this way, never in
-// argv) and returns its output. opts are ssh options (for an unattended caller: BatchMode,
-// ConnectTimeout).
-func sshStdin(host, remote string, stdin []byte, opts ...string) (string, error) {
-	args := []string{}
-	for _, o := range opts {
-		args = append(args, "-o", o)
-	}
-	cmd := exec.Command("ssh", append(args, host, remote)...)
-	cmd.Stdin = bytes.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-func sshImport(host, id string, record []byte) (string, error) {
-	return sshStdin(host, `"$HOME/.local/bin/limitbreak" import-token `+shellQuote(id), record)
-}
-
-// shareTokens copies the unexpired 1-year token of every account, or of the accounts named after
-// host, to the same-named account on host.
-func shareTokens(a *claudeAccounts, args []string, send remoteImport, out io.Writer) error {
-	if len(args) < 1 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: limitbreak share <ssh-host> [name...]")
-	}
-	host := args[0]
-	accounts := a.list()
-	if names := args[1:]; len(names) > 0 {
-		var picked []account
-		for _, name := range names {
-			i := slices.IndexFunc(accounts, func(acc account) bool { return acc.ID == name })
-			if i < 0 {
-				return fmt.Errorf("no account named %q here", name)
-			}
-			picked = append(picked, accounts[i])
-		}
-		accounts = picked
-	}
-	now := a.now()
-	var failed []string
-	shared := 0
-	for _, acc := range accounts {
-		t, ok := a.readLongToken(acc)
-		if !ok || !t.valid(now) {
-			fmt.Fprintf(out, "%s has no 1-year token; skipped (run limitbreak renew %s).\n", acc.ID, acc.ID)
-			continue
-		}
-		record, err := json.Marshal(t)
-		if err != nil {
-			return err
-		}
-		reply, err := send(host, acc.ID, record)
-		if reply != "" {
-			fmt.Fprintf(out, "%s: %s\n", host, reply)
-		}
-		if err != nil {
-			failed = append(failed, acc.ID)
-			continue
-		}
-		shared++
-	}
-	if len(failed) > 0 {
-		return fmt.Errorf("not shared to %s: %s", host, strings.Join(failed, ", "))
-	}
-	fmt.Fprintf(out, "Shared %d token(s) to %s.\n", shared, host)
-	return nil
-}
-
-// importToken stores a token record read from in for the named local account, after Anthropic
-// accepts it. The account must already exist here, so the proxy knows it.
-func importToken(a *claudeAccounts, args []string, validate tokenValidator, in io.Reader, out io.Writer) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: limitbreak import-token <name> < record.json")
-	}
-	raw, err := io.ReadAll(io.LimitReader(in, 64*1024))
-	if err != nil {
-		return err
-	}
-	var t longToken
-	if json.Unmarshal(raw, &t) != nil || !longTokenPattern.MatchString(t.Token) {
-		return fmt.Errorf("no token record on stdin")
-	}
-	if !t.valid(a.now()) {
-		return fmt.Errorf("the token has expired")
-	}
-	var target *account
-	for _, acc := range a.list() {
-		if acc.ID == args[0] {
-			acc := acc
-			target = &acc
-		}
-	}
-	if target == nil {
-		acc, err := a.tokenOnlyAccount(args[0])
-		if err != nil {
-			return err
-		}
-		target = &acc
-	}
-	if status, err := validate(t.Token); err == nil && (status == http.StatusUnauthorized || status == http.StatusForbidden) {
-		return fmt.Errorf("Anthropic rejected the token (HTTP %d); not stored", status)
-	}
-	if err := a.writeLongToken(*target, t); err != nil {
-		return err
-	}
-	fmt.Fprintf(out, "%s now has a 1-year token until %s.\n", target.ID, day(time.UnixMilli(t.ExpiresAt)))
-	return nil
-}
-
-// tokenOnlyAccount is a new account for a token shared from another machine whose account was never
-// signed in here: its dir is made, and the 1-year token stored in it is what makes it an account.
+// tokenOnlyAccount is a new account for a token synced from Coffer whose account was never signed in
+// here: its dir is made, and the 1-year token stored in it is what makes it an account.
 func (a *claudeAccounts) tokenOnlyAccount(name string) (account, error) {
 	if name == defaultID || !accountName.MatchString(name) {
 		return account{}, fmt.Errorf("no account named %q here; sign it in first (limitbreak add %s)", name, name)
@@ -1091,21 +973,68 @@ func (a *claudeAccounts) tokenOnlyAccount(name string) (account, error) {
 	return account{ID: name, Dir: dir, Path: dir}, nil
 }
 
-// shareCommand runs share or unshare for the provider named by --provider (claude by default).
-func shareCommand(command string, a *claudeAccounts, g *grokAccounts, args []string) error {
-	provider, _, rest, err := accountFlags(args)
+// syncerFor is the login syncer for this Mac's Coffer, or the reason there is none.
+func syncerFor(home string) (*loginSyncer, error) {
+	s, err := openLoginSyncer(home, newClaudeAccounts(home, "auto", ""))
+	if err != nil {
+		return nil, fmt.Errorf("Coffer is not set up on this Mac: %w", err)
+	}
+	return s, nil
+}
+
+// shareCommand runs share or unshare for the provider named by --provider (claude by default): the
+// named accounts, or with none every named account of the provider on this Mac.
+func shareCommand(command, home string, args []string, out io.Writer) error {
+	provider, _, names, err := accountFlags(args)
 	if err != nil {
 		return err
 	}
-	switch {
-	case provider == "grok" && command == "share":
-		return shareGrok(newGrokSharer(g, g.home), rest, os.Stdout)
-	case provider == "grok":
-		return unshareGrok(g.home, rest, os.Stdout)
-	case provider != "claude":
-		return fmt.Errorf("share works for claude and grok, not %q", provider)
-	case command == "unshare":
-		return fmt.Errorf("unshare is for Grok shares; 1-year tokens are copies that need no upkeep")
+	s, err := syncerFor(home)
+	if err != nil {
+		return err
 	}
-	return shareTokens(a, rest, sshImport, os.Stdout)
+	k, ok := s.kind(provider)
+	if !ok {
+		return fmt.Errorf("share works for claude, codex and grok, not %q", provider)
+	}
+	all := len(names) == 0
+	if all {
+		names = s.localNames(k)
+		if len(names) == 0 {
+			return fmt.Errorf("no named %s account here to %s (limitbreak add --provider %s <name>)", provider, command, provider)
+		}
+	}
+	var failed []string
+	for _, name := range names {
+		if command == "unshare" {
+			if err := s.unshare(k, name); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "%s/%s: no longer synced on this Mac (Coffer's copy and the local one stay).\n", provider, name)
+			continue
+		}
+		action, err := s.publish(k, name)
+		switch {
+		case errors.Is(err, errNothingToShare) && all:
+			fmt.Fprintf(out, "%s/%s: skipped: %v\n", provider, name, err)
+		case err != nil:
+			fmt.Fprintf(out, "%s/%s: %v\n", provider, name, err)
+			failed = append(failed, name)
+		default:
+			fmt.Fprintf(out, "%s/%s: %s\n", provider, name, action)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Errorf("not shared: %s", strings.Join(failed, ", "))
+	}
+	return nil
+}
+
+// syncNowCommand is `limitbreak sync`: one pass against this Mac's Coffer.
+func syncNowCommand(home string, out io.Writer) error {
+	s, err := syncerFor(home)
+	if err != nil {
+		return err
+	}
+	return syncCommand(s, out)
 }

@@ -40,6 +40,9 @@ const (
 	// grokRefreshWithin is when a named login's access token (about 6 hours long) is refreshed
 	// before it ends.
 	grokRefreshWithin = time.Hour
+	// grokRefreshAhead is how much token life triggers a refresh in the login sync loop, so Coffer holds a
+	// login with at least this much left even when no request needed one.
+	grokRefreshAhead = 3 * time.Hour
 	// grokRefreshEvery is the least time between two refreshes of one login.
 	grokRefreshEvery = 5 * time.Minute
 	// grokUsageEvery is the least time between two usage reads of one account.
@@ -73,8 +76,7 @@ type grokLogin struct {
 	email   string
 	userID  string
 	teamID  string
-	// refreshable is whether the login holds a refresh token. A copy shared from another Mac has
-	// none: only the Mac that signed in refreshes, and pushes each new token.
+	// refreshable is whether the login holds a refresh token; one without cannot be renewed here.
 	refreshable bool
 	// placeholder is the stand-in login grok needs to start with no sign-in (see grokPlaceholderAuth).
 	placeholder bool
@@ -255,10 +257,11 @@ func readGrokLogin(dir string) (grokLogin, bool) {
 	return parseGrokLogin(raw)
 }
 
-// list is ~/.grok when it has a login, then each ~/.grok-<name> that has one, by name. A shared
-// login (no refresh token) is listed with Shared; the placeholder is never an account.
+// list is ~/.grok when it has a login, then each ~/.grok-<name> that has one, by name. A login kept in
+// step with Coffer (see loginsync.go) is listed with Shared; the placeholder is never an account.
 func (a *grokAccounts) list() []account {
 	var found []account
+	synced := syncedAccounts(a.home, a.name())
 	add := func(id, dir, path string) {
 		l, ok := readGrokLogin(path)
 		if !ok || l.placeholder {
@@ -269,7 +272,7 @@ func (a *grokAccounts) list() []account {
 			who = l.userID + "/" + l.teamID
 		}
 		found = append(found, account{ID: id, Email: l.email, Dir: dir, Path: path, Who: who,
-			Shared: !l.refreshable, TokenEnds: l.expires})
+			Shared: synced[id], TokenEnds: l.expires})
 	}
 	add(defaultID, "", filepath.Join(a.home, ".grok"))
 	entries, _ := os.ReadDir(a.home)
@@ -338,7 +341,7 @@ func (a *grokAccounts) authorize(out *http.Request, acc account) bool {
 }
 
 // renew refreshes a named login through grok, at most once per grokRefreshEvery; true when it did.
-// A shared login has no refresh token, so it is never refreshed here: its owner pushes a new one.
+// A login with no refresh token cannot be refreshed; one synced from Coffer is refreshed under its lease.
 func (a *grokAccounts) renew(acc account) bool {
 	if l, ok := readGrokLogin(acc.Path); !ok || !l.refreshable {
 		return false
@@ -358,10 +361,6 @@ func (a *grokAccounts) observe(account, http.Header) time.Time { return time.Tim
 func (a *grokAccounts) unauthorized(acc account) (retry, handBack bool) {
 	if acc.Dir == "" {
 		return false, true
-	}
-	if acc.Shared {
-		log.Printf("grok account %s auth rejected (401); it is a shared login, its owner pushes a new one", acc.ID)
-		return false, false
 	}
 	log.Printf("grok account %s auth rejected (401); refreshing it", acc.ID)
 	return a.renew(acc), false

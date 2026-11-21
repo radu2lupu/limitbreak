@@ -230,59 +230,6 @@ func TestWithLoginHint(t *testing.T) {
 	}
 }
 
-func TestShareCopiesFreshTokensToTheSameNamedAccounts(t *testing.T) {
-	src := newClaudeAccounts(makeHome(t, map[string]string{"default": "a", "work": "b", "spare": "c"}), credentialsFile, "")
-	dst := newClaudeAccounts(makeHome(t, map[string]string{"default": "x", "work": "y"}), credentialsFile, "")
-	now := time.Now()
-	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
-	src.writeLongToken(accountNamed(t, src, "spare"), newLongToken("sk-ant-oat01-spare", now))
-	expired := newLongToken("sk-ant-oat01-old", now.Add(-400*24*time.Hour))
-	src.writeLongToken(accountNamed(t, src, "work"), expired)
-
-	ok := func(string) (int, error) { return 200, nil }
-	send := func(host, id string, record []byte) (string, error) {
-		var out bytes.Buffer
-		err := importToken(dst, []string{id}, ok, bytes.NewReader(record), &out)
-		if err != nil {
-			return err.Error(), err
-		}
-		return strings.TrimSpace(out.String()), nil
-	}
-	var out bytes.Buffer
-	err := shareTokens(src, []string{"mini"}, send, &out)
-	// spare was never signed in on the destination: it arrives as a token-only account. work is
-	// skipped as expired.
-	if err != nil || !strings.Contains(out.String(), "work has no 1-year token") {
-		t.Fatal(err, out.String())
-	}
-	if got := dst.readToken(accountNamed(t, dst, "default")); got != "sk-ant-oat01-def" {
-		t.Fatal(got)
-	}
-	if got := dst.readToken(accountNamed(t, dst, "work")); got != "y" {
-		t.Fatal(got)
-	}
-	if got := dst.readToken(accountNamed(t, dst, "spare")); got != "sk-ant-oat01-spare" {
-		t.Fatal(got)
-	}
-	// A same-named dir another tool keeps is never claimed.
-	other := filepath.Join(dst.home, ".claude-other")
-	os.MkdirAll(other, 0o700)
-	os.WriteFile(filepath.Join(other, "notes"), nil, 0o600)
-	record0, _ := json.Marshal(newLongToken("sk-ant-oat01-x", now))
-	if importToken(dst, []string{"other"}, ok, bytes.NewReader(record0), &bytes.Buffer{}) == nil {
-		t.Fatal("another tool's dir was claimed")
-	}
-
-	rejected := func(string) (int, error) { return 401, nil }
-	record, _ := json.Marshal(newLongToken("sk-ant-oat01-bad", now))
-	if importToken(dst, []string{"work"}, rejected, bytes.NewReader(record), &bytes.Buffer{}) == nil {
-		t.Fatal("a rejected token was imported")
-	}
-	if importToken(dst, []string{"work"}, ok, strings.NewReader("{}"), &bytes.Buffer{}) == nil {
-		t.Fatal("an empty record was imported")
-	}
-}
-
 func TestKeychainModeAlsoReadsTheTokenFile(t *testing.T) {
 	home := makeHome(t, map[string]string{"work": "y"})
 	file := newClaudeAccounts(home, credentialsFile, "")
@@ -503,26 +450,5 @@ func TestAddRefusesAnotherToolsDirAndCodexRemoveKeepsWhatItDidNotMake(t *testing
 	}
 	if _, err := os.Stat(made); !os.IsNotExist(err) {
 		t.Fatal("a dir Limit Break made survived remove")
-	}
-}
-
-func TestShareSendsOnlyTheNamedAccounts(t *testing.T) {
-	src := newClaudeAccounts(makeHome(t, map[string]string{"default": "a", "founder": "b"}), credentialsFile, "")
-	now := time.Now()
-	src.writeLongToken(accountNamed(t, src, "default"), newLongToken("sk-ant-oat01-def", now))
-	src.writeLongToken(accountNamed(t, src, "founder"), newLongToken("sk-ant-oat01-founder", now))
-	var sent []string
-	send := func(host, id string, record []byte) (string, error) {
-		sent = append(sent, id)
-		return "", nil
-	}
-	if err := shareTokens(src, []string{"mini", "founder"}, send, &bytes.Buffer{}); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Join(sent, ",") != "founder" {
-		t.Fatal(sent)
-	}
-	if shareTokens(src, []string{"mini", "nobody"}, send, &bytes.Buffer{}) == nil {
-		t.Fatal("an unknown account name was accepted")
 	}
 }
