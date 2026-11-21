@@ -736,6 +736,13 @@ func TestCofferIsConfiguredByEnvironmentOrFileAndOffWithoutBoth(t *testing.T) {
 	if err != nil || c.base != "http://100.64.0.1:8795" || c.token != "t0k" {
 		t.Fatal(c, err)
 	}
+	// With no environment, the token file beside the address file is used (a Mac whose Keychain is locked).
+	t.Setenv(cofferTokenFileEnv, "")
+	os.WriteFile(cofferTokenFile(home), []byte("f1le\n"), 0o600)
+	if c, err := openCoffer(home); err != nil || c.token != "f1le" {
+		t.Fatal(c, err)
+	}
+	t.Setenv(cofferTokenFileEnv, tokenFile)
 	t.Setenv(cofferAddrEnv, "http://127.0.0.1:9")
 	if c, _ := openCoffer(home); c.base != "http://127.0.0.1:9" {
 		t.Fatal("the environment does not win")

@@ -77,7 +77,7 @@ requests (get, put with `if-version`, list) and is checked by tests against a fa
 one run against a real Coffer built from the branch in a temp dir.
 
 **Configuration (per Mac).** Address: `LIMITBREAK_COFFER_ADDR` or the file `~/.config/limitbreak/coffer`
-(e.g. `http://100.119.127.103:8795`). Token: `LIMITBREAK_COFFER_TOKEN_FILE`, else the login Keychain item with
+(e.g. `http://100.119.127.103:8795`). Token: `LIMITBREAK_COFFER_TOKEN_FILE`, else `~/.config/limitbreak/coffer-token` (0600), else the login Keychain item with
 service `coffer.limitbreak`, account `token`. No address or no token: sync is off and Limit Break behaves as a
 Mac with no Coffer.
 

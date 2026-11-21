@@ -187,12 +187,24 @@ func cofferAddress(home string) string {
 	return strings.TrimSpace(string(raw))
 }
 
+// cofferTokenFile is where a Mac keeps its Coffer token when its login Keychain is locked to a LaunchAgent
+// (a Mac nobody is logged in to, such as the Mini): mode 0600, beside the address file.
+func cofferTokenFile(home string) string {
+	return filepath.Join(home, ".config", "limitbreak", "coffer-token")
+}
+
 // cofferToken is this Mac's Coffer identity token: the file named by $LIMITBREAK_COFFER_TOKEN_FILE, else
-// the login Keychain item (service coffer.limitbreak, account token). It is never logged.
-func cofferToken() string {
+// the token file beside the address file, else the login Keychain item (service coffer.limitbreak,
+// account token). It is never logged.
+func cofferToken(home string) string {
 	if path := os.Getenv(cofferTokenFileEnv); path != "" {
 		raw, _ := os.ReadFile(path)
 		return strings.TrimSpace(string(raw))
+	}
+	if raw, err := os.ReadFile(cofferTokenFile(home)); err == nil {
+		if token := strings.TrimSpace(string(raw)); token != "" {
+			return token
+		}
 	}
 	out, err := exec.Command("security", "find-generic-password", "-s", cofferKeychainService, "-a", "token", "-w").Output()
 	if err != nil {
@@ -208,9 +220,9 @@ func openCoffer(home string) (*cofferClient, error) {
 	if addr == "" {
 		return nil, fmt.Errorf("no Coffer address (set %s or write it to %s)", cofferAddrEnv, cofferConfigFile(home))
 	}
-	token := cofferToken()
+	token := cofferToken(home)
 	if token == "" {
-		return nil, fmt.Errorf("no Coffer token (Keychain service %s, or %s)", cofferKeychainService, cofferTokenFileEnv)
+		return nil, fmt.Errorf("no Coffer token (%s, %s, or Keychain service %s)", cofferTokenFileEnv, cofferTokenFile(home), cofferKeychainService)
 	}
 	return newCofferClient(addr, token)
 }
