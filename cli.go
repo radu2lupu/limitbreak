@@ -27,6 +27,14 @@ limitbreak renew [name...] [--all]
 limitbreak share <ssh-host> [name...]
                                 copy the 1-year tokens (all, or the named accounts) to the same-named
                                 accounts on another machine
+limitbreak share <ssh-host> [name...] --provider grok
+                                give another Mac a token-only copy of this Mac's Grok login (no refresh
+                                token) and keep it fresh while limitbreak serve runs
+limitbreak unshare <ssh-host> [name...] --provider grok
+                                stop keeping that Mac's copy fresh
+limitbreak grok-placeholder <dir>
+                                put the stand-in auth.json in a Grok home so grok starts there with no
+                                sign-in (Limit Break swaps in the shared login on every request)
 limitbreak remove <name> [-y]   sign an account out and delete its login
 limitbreak blame [--since 24h] [--account ID] [--by session|project|account|client|model] [--json]
                                 which sessions used the limits (from the request log)
@@ -69,8 +77,12 @@ func runCommand(command string, args []string) int {
 		err = backfillCommand(home, args, time.Now(), os.Stdout)
 	case "renew":
 		err = renewAccounts(a, args, setupTokenRunner(a), countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdout)
-	case "share":
-		err = shareTokens(a, args, sshImport, os.Stdout)
+	case "share", "unshare":
+		err = shareCommand(command, a, newGrokAccounts(home, "", envString("LIMITBREAK_GROK_UPSTREAM", defaultGrokUpstream)), args)
+	case "import-grok":
+		err = importGrok(newGrokAccounts(home, "", ""), args, os.Stdin, os.Stdout)
+	case "grok-placeholder":
+		err = grokPlaceholderCommand(args, os.Stdout)
 	case "import-token":
 		err = importToken(a, args, countTokensValidator(envString("LIMITBREAK_UPSTREAM", defaultUpstream)), os.Stdin, os.Stdout)
 	default:
@@ -1077,4 +1089,23 @@ func (a *claudeAccounts) tokenOnlyAccount(name string) (account, error) {
 		return account{}, err
 	}
 	return account{ID: name, Dir: dir, Path: dir}, nil
+}
+
+// shareCommand runs share or unshare for the provider named by --provider (claude by default).
+func shareCommand(command string, a *claudeAccounts, g *grokAccounts, args []string) error {
+	provider, _, rest, err := accountFlags(args)
+	if err != nil {
+		return err
+	}
+	switch {
+	case provider == "grok" && command == "share":
+		return shareGrok(newGrokSharer(g, g.home), rest, os.Stdout)
+	case provider == "grok":
+		return unshareGrok(g.home, rest, os.Stdout)
+	case provider != "claude":
+		return fmt.Errorf("share works for claude and grok, not %q", provider)
+	case command == "unshare":
+		return fmt.Errorf("unshare is for Grok shares; 1-year tokens are copies that need no upkeep")
+	}
+	return shareTokens(a, rest, sshImport, os.Stdout)
 }

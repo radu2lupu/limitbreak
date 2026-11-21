@@ -149,6 +149,11 @@ type account struct {
 	// Who identifies the subscription behind the login: two accounts with the same Who add no
 	// capacity. Claude: the email. Codex: the ChatGPT user and workspace.
 	Who string `json:"-"`
+	// Shared is a login copied from another Mac's: it has no refresh token and stays fresh only
+	// because its owner pushes each new token.
+	Shared bool `json:"-"`
+	// TokenEnds is when the login's access token ends (Grok, about 6 hours long); zero when unknown.
+	TokenEnds time.Time `json:"-"`
 }
 
 // claudeAccounts is the Claude provider: the logins Claude Code holds on this host.
@@ -741,6 +746,7 @@ func serve(args []string) {
 	go newAuthWatch(a, notifyDesktop).run()
 	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
+	go newGrokSharer(grok, *homeFlag).run()
 	px := newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))
 	px.requests = newRequestLog(*homeFlag)
 	opencode := newOpencodeAccounts(*homeFlag, *opencodeUsage)

@@ -244,6 +244,10 @@ type accountStatus struct {
 	Windows []usageWindow `json:"windows"`
 	// SameAs is the account this one is a second sign-in to (same subscription); it is never rotated to.
 	SameAs string `json:"sameAs,omitempty"`
+	// Shared is a login copied from another Mac: usable while TokenEnds is in the future.
+	Shared bool `json:"shared,omitempty"`
+	// TokenEnds is when the account's access token ends (unix seconds; Grok); null when unknown.
+	TokenEnds *int64 `json:"tokenEnds"`
 }
 
 func (p *pool) status() []accountStatus {
@@ -270,6 +274,11 @@ func (p *pool) status() []accountStatus {
 			}
 		}
 		sort.Strings(s.ActiveFor)
+		s.Shared = acc.Shared
+		if !acc.TokenEnds.IsZero() {
+			unix := acc.TokenEnds.Unix()
+			s.TokenEnds = &unix
+		}
 		out = append(out, s)
 	}
 	p.mu.Unlock()

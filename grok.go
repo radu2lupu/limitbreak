@@ -73,6 +73,11 @@ type grokLogin struct {
 	email   string
 	userID  string
 	teamID  string
+	// refreshable is whether the login holds a refresh token. A copy shared from another Mac has
+	// none: only the Mac that signed in refreshes, and pushes each new token.
+	refreshable bool
+	// placeholder is the stand-in login grok needs to start with no sign-in (see grokPlaceholderAuth).
+	placeholder bool
 }
 
 // parseGrokLogin reads grok's auth.json, a map of logins by issuer: the one with a token that lasts
@@ -84,6 +89,7 @@ func parseGrokLogin(raw []byte) (grokLogin, bool) {
 		Email     string `json:"email"`
 		UserID    string `json:"user_id"`
 		TeamID    string `json:"team_id"`
+		Refresh   string `json:"refresh_token"`
 	}
 	if json.Unmarshal(raw, &doc) != nil {
 		return grokLogin{}, false
@@ -94,7 +100,8 @@ func parseGrokLogin(raw []byte) (grokLogin, bool) {
 		if e.Key == "" {
 			continue
 		}
-		l := grokLogin{token: e.Key, email: e.Email, userID: e.UserID, teamID: e.TeamID}
+		l := grokLogin{token: e.Key, email: e.Email, userID: e.UserID, teamID: e.TeamID, refreshable: e.Refresh != "",
+			placeholder: e.Email == grokPlaceholderEmail}
 		if t, err := time.Parse(time.RFC3339Nano, e.ExpiresAt); err == nil {
 			l.expires = t
 		} else {
@@ -248,19 +255,21 @@ func readGrokLogin(dir string) (grokLogin, bool) {
 	return parseGrokLogin(raw)
 }
 
-// list is ~/.grok when it has a login, then each ~/.grok-<name> that has one, by name.
+// list is ~/.grok when it has a login, then each ~/.grok-<name> that has one, by name. A shared
+// login (no refresh token) is listed with Shared; the placeholder is never an account.
 func (a *grokAccounts) list() []account {
 	var found []account
 	add := func(id, dir, path string) {
 		l, ok := readGrokLogin(path)
-		if !ok {
+		if !ok || l.placeholder {
 			return
 		}
 		who := ""
 		if l.userID != "" {
 			who = l.userID + "/" + l.teamID
 		}
-		found = append(found, account{ID: id, Email: l.email, Dir: dir, Path: path, Who: who})
+		found = append(found, account{ID: id, Email: l.email, Dir: dir, Path: path, Who: who,
+			Shared: !l.refreshable, TokenEnds: l.expires})
 	}
 	add(defaultID, "", filepath.Join(a.home, ".grok"))
 	entries, _ := os.ReadDir(a.home)
@@ -277,14 +286,30 @@ func (a *grokAccounts) list() []account {
 
 func (a *grokAccounts) serves(path string) bool { return strings.HasPrefix(path, grokMount+"/") }
 
-// spends is a model turn; path is the upstream one (without the mount).
-func (a *grokAccounts) spends(path string) bool {
+// spends is a request put on an account; path is the upstream one (without the mount). With no
+// login of its own here (nothing in ~/.grok), grok has no credentials worth keeping, so every
+// request is put on an account, not only the model turns; a request with no account to go on is
+// still sent as the client made it.
+func (a *grokAccounts) spends(path string) bool { return a.turn(path) || a.loginless() }
+
+// logs is only the model turns: the rest of what spends (models, settings, traces) says no usage.
+func (a *grokAccounts) logs(path string) bool { return a.turn(path) }
+
+// turn is a model turn.
+func (a *grokAccounts) turn(path string) bool {
 	for _, turn := range []string{"/v1/responses", "/v1/chat/completions", "/v1/messages"} {
 		if path == turn || strings.HasPrefix(path, turn+"/") || strings.HasPrefix(path, turn+"?") {
 			return true
 		}
 	}
 	return false
+}
+
+// loginless is whether this host's own grok has no sign-in: ~/.grok holds no login (a placeholder is
+// none).
+func (a *grokAccounts) loginless() bool {
+	l, ok := readGrokLogin(filepath.Join(a.home, ".grok"))
+	return !ok || l.placeholder
 }
 
 // authorize keeps the client's own credentials for the default account; a named one gets its
@@ -313,7 +338,11 @@ func (a *grokAccounts) authorize(out *http.Request, acc account) bool {
 }
 
 // renew refreshes a named login through grok, at most once per grokRefreshEvery; true when it did.
+// A shared login has no refresh token, so it is never refreshed here: its owner pushes a new one.
 func (a *grokAccounts) renew(acc account) bool {
+	if l, ok := readGrokLogin(acc.Path); !ok || !l.refreshable {
+		return false
+	}
 	return a.refreshed.renew(a.name(), "grok models", acc, a.now(), grokRefreshEvery, a.refresh)
 }
 
@@ -329,6 +358,10 @@ func (a *grokAccounts) observe(account, http.Header) time.Time { return time.Tim
 func (a *grokAccounts) unauthorized(acc account) (retry, handBack bool) {
 	if acc.Dir == "" {
 		return false, true
+	}
+	if acc.Shared {
+		log.Printf("grok account %s auth rejected (401); it is a shared login, its owner pushes a new one", acc.ID)
+		return false, false
 	}
 	log.Printf("grok account %s auth rejected (401); refreshing it", acc.ID)
 	return a.renew(acc), false
