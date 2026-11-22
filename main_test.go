@@ -599,3 +599,40 @@ func TestA401DropsTheKeptTokenAndRetriesOnceWithAFreshRead(t *testing.T) {
 		t.Fatal(status, up.seen)
 	}
 }
+
+// A login held only in the Keychain stays listed while the Keychain stops answering: dropping it left
+// only the spent default, and requests passed through to that login's usage limit (2026-11-22).
+func TestAKeychainOnlyLoginStaysListedWhileTheKeychainIsDown(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "t-default"})
+	if err := os.MkdirAll(filepath.Join(home, ".claude-work"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	answers := filepath.Join(bin, "answers")
+	cred := `{"claudeAiOauth":{"accessToken":"t-work","expiresAt":99999999999999}}`
+	script := "#!/bin/sh\nif [ -e " + answers + " ]; then\n  case \"$*\" in *'" + keychainService(filepath.Join(home, ".claude-work")) + "'*) echo '" + cred + "'; exit 0;; esac\n  exit 44\nfi\nexec sleep 30\n"
+	if err := os.WriteFile(filepath.Join(bin, "security"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(answers, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	a := newClaudeAccounts(home, credentialsKeychain, "")
+	ids := func() []string {
+		var out []string
+		for _, acc := range a.list() {
+			out = append(out, acc.ID)
+		}
+		return out
+	}
+	if got := ids(); len(got) != 2 || got[0] != defaultID || got[1] != "work" {
+		t.Fatalf("with the Keychain answering: %v", got)
+	}
+	if err := os.Remove(answers); err != nil {
+		t.Fatal(err)
+	}
+	if got := ids(); len(got) != 2 || got[0] != defaultID || got[1] != "work" {
+		t.Fatalf("with the Keychain down: %v, want the Keychain-only login kept", got)
+	}
+}

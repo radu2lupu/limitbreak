@@ -169,6 +169,8 @@ type claudeAccounts struct {
 	// one. Both are guarded by mu.
 	tokens     map[string]cachedToken
 	rejectedAt map[string]time.Time
+	// known is the last account list read while the Keychain answered (guarded by mu); see list.
+	known []account
 }
 
 // cachedToken is a token that was read and the end of its validity.
@@ -229,6 +231,37 @@ func (a *claudeAccounts) list() []account {
 		found[i].AuthEnds, _ = a.authInfoFrom(found[i], sources[i])
 		found[i].Plan = subscription(sources[i])
 	}
+	return a.keepKnown(found)
+}
+
+// keepKnown is found, plus the accounts the last full read had, when the Keychain stopped answering during
+// this one. A login held only in the Keychain is unreadable then; dropping it from the list left only spent
+// logins, so requests passed through to the client's own spent login and failed with its usage limit
+// while another account still had room. A kept account whose token cannot be read is skipped by
+// authorize like any other.
+func (a *claudeAccounts) keepKnown(found []account) []account {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.now().Before(a.keychainDownUntil) {
+		a.known = append([]account(nil), found...)
+		return found
+	}
+	have := map[string]bool{}
+	for _, acc := range found {
+		have[acc.ID] = true
+	}
+	for _, acc := range a.known {
+		if !have[acc.ID] {
+			found = append(found, acc)
+		}
+	}
+	// Default first, then by name, as a full read orders them.
+	sort.SliceStable(found, func(i, j int) bool {
+		if (found[i].ID == defaultID) != (found[j].ID == defaultID) {
+			return found[i].ID == defaultID
+		}
+		return found[i].ID < found[j].ID
+	})
 	return found
 }
 
@@ -259,9 +292,20 @@ func keychainQueries(configDir string) [][]string {
 	return queries
 }
 
+func (a *claudeAccounts) cofferManaged(name string) bool {
+	if name == defaultID {
+		return false
+	}
+	entry, ok := readSyncState(a.home)[loginPath("claude", name)]
+	return ok && !entry.Ignored
+}
+
 // credentialSources are the credential documents Claude Code may hold for a login: its Keychain
 // item and its file. Either can be the stale leftover of an older sign-in, so every one is read.
 func (a *claudeAccounts) credentialSources(configDir, path string) [][]byte {
+	if name, named := strings.CutPrefix(filepath.Base(configDir), ".claude-"); named && a.cofferManaged(name) {
+		return nil
+	}
 	var sources [][]byte
 	if a.credentials == credentialsKeychain {
 		// Claude Code files its item under the user's name; other items with the same service
@@ -329,6 +373,9 @@ func (a *claudeAccounts) token(acc account) string {
 	if live, expires := a.readTokenUntil(acc); live != "" {
 		a.keepToken(acc, live, expires)
 		return live
+	}
+	if a.cofferManaged(acc.ID) {
+		return ""
 	}
 	a.refresh(acc)
 	live, expires := a.readTokenUntil(acc)
