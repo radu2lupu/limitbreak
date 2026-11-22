@@ -165,6 +165,16 @@ type claudeAccounts struct {
 	mu sync.Mutex
 	// keychainDownUntil is when Keychain reads resume after one timed out.
 	keychainDownUntil time.Time
+	// tokens is each account's last good token (see token); rejectedAt is when a 401 last dropped
+	// one. Both are guarded by mu.
+	tokens     map[string]cachedToken
+	rejectedAt map[string]time.Time
+}
+
+// cachedToken is a token that was read and the end of its validity.
+type cachedToken struct {
+	token   string
+	expires time.Time
 }
 
 func newClaudeAccounts(home, credentials, claude string) *claudeAccounts {
@@ -301,20 +311,73 @@ func (a *claudeAccounts) readKeychain(args []string) (out []byte, ok bool) {
 	return out, err == nil
 }
 
-// token is a live access token, refreshed through Claude Code when every one has expired.
+// tokenMargin ends a cached token a minute early, so one is never sent in the seconds it dies.
+// rejectWindow is how long after a 401 dropped a token a second 401 means the fresh one is dead too.
+const (
+	tokenMargin  = time.Minute
+	rejectWindow = time.Minute
+)
+
+// token is a live access token, refreshed through Claude Code when every one has expired. The last
+// good one is kept in memory until it ends: a Keychain that fails for a moment (another process's
+// authorization dialog, a lock) must not bench an account that holds a valid token, and a request
+// then spawns no `security` at all.
 func (a *claudeAccounts) token(acc account) string {
-	if live := a.readToken(acc); live != "" {
+	if t := a.cachedToken(acc); t != "" {
+		return t
+	}
+	if live, expires := a.readTokenUntil(acc); live != "" {
+		a.keepToken(acc, live, expires)
 		return live
 	}
 	a.refresh(acc)
-	return a.readToken(acc)
+	live, expires := a.readTokenUntil(acc)
+	if live != "" {
+		a.keepToken(acc, live, expires)
+	}
+	return live
+}
+
+// cachedToken is the account's kept token while it is still valid; empty otherwise.
+func (a *claudeAccounts) cachedToken(acc account) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if c, ok := a.tokens[acc.ID]; ok && c.expires.After(a.now().Add(tokenMargin)) {
+		return c.token
+	}
+	return ""
+}
+
+func (a *claudeAccounts) keepToken(acc account, token string, expires time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tokens == nil {
+		a.tokens = map[string]cachedToken{}
+	}
+	a.tokens[acc.ID] = cachedToken{token: token, expires: expires}
+}
+
+// forgetToken drops the account's kept token, so the next token() reads it again. It reports
+// whether there was one.
+func (a *claudeAccounts) forgetToken(acc account) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.tokens[acc.ID]
+	delete(a.tokens, acc.ID)
+	return ok
 }
 
 // readToken is the account's unexpired long-lived token when it has one (see longtoken.go), else
 // the access token that has not expired and lasts longest, across the login's sources.
 func (a *claudeAccounts) readToken(acc account) string {
+	t, _ := a.readTokenUntil(acc)
+	return t
+}
+
+// readTokenUntil is readToken and the end of the token's validity.
+func (a *claudeAccounts) readTokenUntil(acc account) (string, time.Time) {
 	if long, ok := a.readLongToken(acc); ok && long.valid(a.now()) {
-		return long.Token
+		return long.Token, time.UnixMilli(long.ExpiresAt)
 	}
 	var best string
 	bestExpiry := -1.0
@@ -334,7 +397,7 @@ func (a *claudeAccounts) readToken(acc account) string {
 			best, bestExpiry = l.AccessToken, expiry
 		}
 	}
-	return best
+	return best, time.UnixMilli(int64(bestExpiry))
 }
 
 type login struct {
@@ -429,9 +492,24 @@ func (a *claudeAccounts) observe(acc account, h http.Header) time.Time {
 	return time.Time{}
 }
 
-// unauthorized: the account's token is dead (revoked, or its auth ended). Claude must not see that
-// as its own login failing, so the account is skipped for a while, like a spent one.
+// unauthorized: the account's token was rejected. A kept token may simply be stale (renewed or
+// rotated since it was read), so the first 401 drops it and sends again with a fresh read. If the
+// fresh token is rejected too, or none was kept, the token is dead: Claude must not see that as its
+// own login failing, so the account is skipped for a while, like a spent one.
 func (a *claudeAccounts) unauthorized(acc account) (retry, handBack bool) {
+	a.mu.Lock()
+	again := a.now().Sub(a.rejectedAt[acc.ID]) < rejectWindow
+	a.mu.Unlock()
+	if !again && a.forgetToken(acc) {
+		a.mu.Lock()
+		if a.rejectedAt == nil {
+			a.rejectedAt = map[string]time.Time{}
+		}
+		a.rejectedAt[acc.ID] = a.now()
+		a.mu.Unlock()
+		return true, false
+	}
+	a.forgetToken(acc)
 	log.Printf("account %s auth rejected (401); run \"limitbreak renew %s\"", acc.ID, acc.ID)
 	return false, false
 }

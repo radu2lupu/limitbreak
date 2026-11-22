@@ -126,7 +126,8 @@ func longTokenPath(acc account) string { return filepath.Join(acc.Path, longToke
 func (a *claudeAccounts) readLongToken(acc account) (longToken, bool) {
 	var sources [][]byte
 	if a.credentials == credentialsKeychain {
-		if out, err := exec.Command("security", "find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w").Output(); err == nil {
+		// Through readKeychain: bounded by keychainTimeout, so a stuck prompt cannot hang a request.
+		if out, ok := a.readKeychain([]string{"find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w"}); ok {
 			sources = append(sources, out)
 		}
 	}
@@ -146,6 +147,8 @@ func (a *claudeAccounts) readLongToken(acc account) (longToken, bool) {
 }
 
 func (a *claudeAccounts) writeLongToken(acc account, t longToken) error {
+	// A new token replaces the kept one at once.
+	a.forgetToken(acc)
 	raw, err := json.Marshal(t)
 	if err != nil {
 		return err
@@ -179,6 +182,7 @@ func (a *claudeAccounts) writeLongToken(acc account, t longToken) error {
 
 // deleteLongToken removes the account's long-lived token; none stored is not an error.
 func (a *claudeAccounts) deleteLongToken(acc account) error {
+	a.forgetToken(acc)
 	if a.credentials == credentialsKeychain {
 		// Exit status 44 is "not found"; any other failure leaves nothing we can do from here.
 		_ = exec.Command("security", "delete-generic-password", "-a", acc.ID, "-s", longTokenService).Run()

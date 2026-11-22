@@ -271,7 +271,7 @@ func TestAnAccountWhoseTokenIsRejectedIsSkippedWithoutClaudeSeeingThe401(t *test
 		t.Fatal(status, body)
 	}
 	post(t, server.URL, "/v1/messages")
-	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-work,Bearer t-work" {
+	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-default,Bearer t-work,Bearer t-work" {
 		t.Fatal(up.seen)
 	}
 }
@@ -283,7 +283,7 @@ func TestEveryTokenRejectedFallsBackToClaudesOwnLogin(t *testing.T) {
 	if status, _ := post(t, server.URL, "/v1/messages"); status != 200 {
 		t.Fatal(status)
 	}
-	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-work,Bearer claude-own-login" {
+	if strings.Join(up.seen, ",") != "Bearer t-default,Bearer t-default,Bearer t-work,Bearer t-work,Bearer claude-own-login" {
 		t.Fatal(up.seen)
 	}
 }
@@ -526,5 +526,76 @@ func TestClaudeRequestsGoUpstreamWithTheHourCache(t *testing.T) {
 	}
 	if len(bodies) != 2 || !strings.Contains(bodies[0], `"ttl":"1h"`) || bodies[1] != in {
 		t.Fatalf("%q", bodies)
+	}
+}
+
+// The incident of 2026-11-22: another process's authorization dialog made every `security` call fail
+// for a few seconds, and each account was benched for five minutes because it "had no token".
+func TestAKeptTokenSurvivesAKeychainThatStopsAnswering(t *testing.T) {
+	bin, marker, calls := t.TempDir(), filepath.Join(t.TempDir(), "up"), filepath.Join(t.TempDir(), "calls")
+	script := "#!/bin/sh\necho x >> " + calls + "\n[ -e " + marker + " ] || { echo 'CSSM Exception -60008' >&2; exit 1; }\n" +
+		`echo '{"token":"sk-ant-oat01-long","expiresAt":` + fmt.Sprint(int64(far)*1000) + `}'` + "\n"
+	if err := os.WriteFile(filepath.Join(bin, "security"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := os.WriteFile(marker, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := newClaudeAccounts(makeHome(t, map[string]string{"work": "t-work"}), credentialsKeychain, "")
+	acc := accountNamed(t, a, "work")
+
+	if got := a.token(acc); got != "sk-ant-oat01-long" {
+		t.Fatal(got)
+	}
+	spawned := func() int { raw, _ := os.ReadFile(calls); return strings.Count(string(raw), "x") }
+	before := spawned()
+	if got := a.token(acc); got != "sk-ant-oat01-long" || spawned() != before {
+		t.Fatalf("a kept token must be served without asking the Keychain: %q, %d new calls", got, spawned()-before)
+	}
+	// The Keychain fails and so does a dropped cache's re-read; the account falls back to its file token...
+	os.Remove(marker)
+	if !a.forgetToken(acc) {
+		t.Fatal("nothing was kept")
+	}
+	if got := a.token(acc); got != "t-work" {
+		t.Fatal("without a kept token the other source answers:", got)
+	}
+	// ...but a kept token is not lost to a failing read.
+	a.keepToken(acc, "sk-ant-oat01-kept", a.now().Add(time.Hour))
+	if got := a.token(acc); got != "sk-ant-oat01-kept" {
+		t.Fatal(got)
+	}
+	// An ended one is not served.
+	a.keepToken(acc, "sk-ant-oat01-ended", a.now().Add(30*time.Second))
+	if got := a.token(acc); got == "sk-ant-oat01-ended" {
+		t.Fatal("a token inside its margin must be read again")
+	}
+}
+
+func TestA401DropsTheKeptTokenAndRetriesOnceWithAFreshRead(t *testing.T) {
+	up := newUpstream(t)
+	home := makeHome(t, map[string]string{"work": "t-old"})
+	acc := newClaudeAccounts(home, credentialsFile, "")
+	acc.claude = ""
+	server := httptest.NewServer(newProxy(newPool(acc, up.URL)))
+	t.Cleanup(server.Close)
+
+	if status, _ := post(t, server.URL, "/v1/messages"); status != 200 {
+		t.Fatal(status)
+	}
+	// The login was renewed since the token was kept: the old one is dead, the file holds a new one.
+	up.unauthorized = []string{"t-old"}
+	writeJSON(t, filepath.Join(home, ".claude-work", ".credentials.json"),
+		map[string]any{"claudeAiOauth": map[string]any{"accessToken": "t-new", "expiresAt": float64(far) * 1000}})
+	if status, _ := post(t, server.URL, "/v1/messages"); status != 200 {
+		t.Fatal(status)
+	}
+	if got := strings.Join(up.seen, ","); got != "Bearer t-old,Bearer t-old,Bearer t-new" {
+		t.Fatal(got)
+	}
+	// The account was not benched: the next request goes on it, from the kept new token.
+	if status, _ := post(t, server.URL, "/v1/messages"); status != 200 || up.seen[len(up.seen)-1] != "Bearer t-new" {
+		t.Fatal(status, up.seen)
 	}
 }
