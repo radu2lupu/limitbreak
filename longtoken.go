@@ -125,7 +125,7 @@ func longTokenPath(acc account) string { return filepath.Join(acc.Path, longToke
 // readLongToken is the account's stored long-lived token, expired or not; false when none.
 func (a *claudeAccounts) readLongToken(acc account) (longToken, bool) {
 	var sources [][]byte
-	if a.credentials == credentialsKeychain {
+	if a.credentials == credentialsKeychain && !a.cofferManaged(acc.ID) {
 		// Through readKeychain: bounded by keychainTimeout, so a stuck prompt cannot hang a request.
 		if out, ok := a.readKeychain([]string{"find-generic-password", "-a", acc.ID, "-s", longTokenService, "-w"}); ok {
 			sources = append(sources, out)
@@ -149,11 +149,15 @@ func (a *claudeAccounts) readLongToken(acc account) (longToken, bool) {
 func (a *claudeAccounts) writeLongToken(acc account, t longToken) error {
 	// A new token replaces the kept one at once.
 	a.forgetToken(acc)
+	return a.storeLongToken(acc, t, a.credentials == credentialsKeychain && !a.cofferManaged(acc.ID))
+}
+
+func (a *claudeAccounts) storeLongToken(acc account, t longToken, keychain bool) error {
 	raw, err := json.Marshal(t)
 	if err != nil {
 		return err
 	}
-	if a.credentials == credentialsKeychain {
+	if keychain {
 		// `security` takes the secret as an argument, so it is visible in the process list for the
 		// moment the command runs. Acceptable on a single-user Mac; it is never written to a log.
 		out, err := exec.Command("security", "add-generic-password", "-U", "-a", acc.ID, "-s", longTokenService, "-w", string(raw)).CombinedOutput()
@@ -183,7 +187,7 @@ func (a *claudeAccounts) writeLongToken(acc account, t longToken) error {
 // deleteLongToken removes the account's long-lived token; none stored is not an error.
 func (a *claudeAccounts) deleteLongToken(acc account) error {
 	a.forgetToken(acc)
-	if a.credentials == credentialsKeychain {
+	if a.credentials == credentialsKeychain && !a.cofferManaged(acc.ID) {
 		// Exit status 44 is "not found"; any other failure leaves nothing we can do from here.
 		_ = exec.Command("security", "delete-generic-password", "-a", acc.ID, "-s", longTokenService).Run()
 	}

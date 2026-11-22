@@ -795,3 +795,44 @@ func TestShareAndSyncCommandsRunAgainstTheConfiguredCoffer(t *testing.T) {
 		t.Fatal("shared an unsupported provider")
 	}
 }
+
+func TestTrackedClaudeLoginMigratesToFileAndSurvivesRestart(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("PATH", home) // Neither security nor Claude Code is available.
+	store := newFakeCoffer()
+	now := time.Now()
+	token := newLongToken("sk-ant-oat01-managed", now)
+	raw := mustJSON(token)
+	path := loginPath("claude", "work")
+	version, err := store.putIf(path, raw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claude := newClaudeAccounts(home, credentialsKeychain, "")
+	syncer := newLoginSyncer(home, store, loginKinds(claude, nil))
+	kind, _ := syncer.kind("claude")
+	acc := syncer.account(kind, "work")
+	if err := os.Mkdir(acc.Path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(acc.Path, "existing-config"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syncer.record(path, syncEntry{Version: version, Fingerprint: fingerprint(raw)}); err != nil {
+		t.Fatal(err)
+	}
+	if action, err := syncer.syncLocked(kind, "work"); err != nil || action != "installed" {
+		t.Fatalf("migration = %q, %v", action, err)
+	}
+	info, err := os.Stat(longTokenPath(acc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("cache mode = %o", mode)
+	}
+	restarted := newClaudeAccounts(home, credentialsKeychain, "")
+	if got := restarted.token(accountNamed(t, restarted, "work")); got != token.Token {
+		t.Fatal("restarted proxy could not load the cached token")
+	}
+}
