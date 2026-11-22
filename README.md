@@ -38,7 +38,7 @@ It does the same for Codex on ChatGPT sign-ins, see [Codex](#codex), and for Gro
 - Only `/v1/messages*` requests are sent on an account's token. Everything else (claude.ai connectors, MCP, artifacts, profile) goes through untouched with Claude Code's own credentials, so those keep working.
 - It never sets `CLAUDE_CODE_OAUTH_TOKEN` (that makes Claude Code drop its connectors and local MCP servers).
 - Accounts are the logins Claude Code already holds: the default one plus every `~/.claude-<name>` config directory that has a login. An account's token is its 1-year token from `limitbreak renew` when it has one, else the sign-in token read from the macOS Keychain item Claude Code keeps per config dir, or from `<dir>/.credentials.json`. Tokens are never logged or exposed by `GET /_status`, and sign-in tokens are never copied.
-- An expired token is refreshed by running one tiny `claude -p` under that account's directory, so Claude Code stays the only thing that refreshes a login.
+- A token is kept in memory until it ends, so a request does not ask the Keychain for it and a Keychain that briefly fails (another process's authorization dialog, a lock) does not bench the account. An expired token is refreshed by running one tiny `claude -p` under that account's directory, so Claude Code stays the only thing that refreshes a login.
 - If no account can serve a request, it passes through with Claude Code's own login: never worse than no proxy.
 - Only a window rejection (`429` with `anthropic-ratelimit-unified-status: rejected`) switches accounts. Ordinary rate limits go back to Claude unchanged.
 - A running session stays on the account it is on until that account is spent: the prompt cache is per account, and a move re-sends its whole context as a cache write. When the client's active account changes, only new sessions (and sessions idle for over an hour, whose cache has expired) take the new one.
@@ -91,7 +91,7 @@ For each account it runs Claude Code's `claude setup-token` and you authorize on
 
 To use the same tokens on another machine of yours, keep them in Coffer: `limitbreak share founder` publishes the account's token and `limitbreak sync` (or the running proxy, every 5 minutes) installs it on the other Mac as `~/.claude-founder`, after Anthropic accepts it. See [Logins from Coffer](#logins-from-coffer). Unlike a sign-in, a 1-year token never rotates, so two machines holding it do not log each other out. A same-named dir another tool keeps is left alone.
 
-`limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
+`limitbreak list` shows when each account's auth ends. The running proxy warns 7 days before any auth ends, in its log and, on macOS, as a notification. If Anthropic rejects an account's token (401), the proxy drops the kept token and sends once more with a fresh read; if that is rejected too it skips that account for a few minutes and logs `run "limitbreak renew <name>"`; Claude never sees the error.
 
 ## Which sessions used the limits
 
