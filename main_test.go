@@ -657,3 +657,15 @@ func TestManagedClaudePoolExcludesLocalLogins(t *testing.T) {
 		t.Fatal("managed pool served the native Claude sign-in")
 	}
 }
+
+func TestStatusMarksAHostThatTakesAPlaceholderLogin(t *testing.T) {
+	for _, managed := range []bool{false, true} {
+		px := newProxy()
+		px.placeholderLogin = managed
+		rec := httptest.NewRecorder()
+		px.ServeHTTP(rec, httptest.NewRequest("GET", "/_status", nil))
+		if got := rec.Header().Get(placeholderLoginHeader) == "1"; got != managed {
+			t.Fatalf("managed=%v: header %v", managed, rec.Header())
+		}
+	}
+}
