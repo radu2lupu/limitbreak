@@ -765,3 +765,25 @@ func syncCommand(s *loginSyncer, out interface{ Write([]byte) (int, error) }) er
 	}
 	return nil
 }
+
+// ownedDefault is the Coffer name this Mac's default login (~/.codex, ~/.grok) is published under, when
+// this Mac's sync state says it owns one (limitbreak share default --as <name>). On a Mac with Coffer set
+// up that is the only way the default dir is served: under its Coffer name, never as "default".
+func ownedDefault(home, provider string) (string, bool) {
+	for name, e := range syncedEntries(home, provider) {
+		if e.Default {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// hasAccount is whether list already holds an account with this id.
+func hasAccount(list []account, id string) bool {
+	for _, acc := range list {
+		if acc.ID == id {
+			return true
+		}
+	}
+	return false
+}

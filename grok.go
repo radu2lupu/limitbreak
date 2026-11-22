@@ -206,7 +206,10 @@ func grokBillingWindows(raw []byte, now time.Time) ([]usageWindow, error) {
 // MARK: Accounts
 
 type grokAccounts struct {
-	home     string
+	home string
+	// managed is a Mac with Coffer set up: its default login is served only under the Coffer name it is
+	// published as (see ownedDefault), never as "default".
+	managed  bool
 	grok     string
 	upstream string
 	now      func() time.Time
@@ -274,7 +277,13 @@ func (a *grokAccounts) list() []account {
 		found = append(found, account{ID: id, Email: l.email, Dir: dir, Path: path, Who: who,
 			Shared: synced[id], TokenEnds: l.expires})
 	}
-	add(defaultID, "", filepath.Join(a.home, ".grok"))
+	if a.managed {
+		if name, ok := ownedDefault(a.home, a.name()); ok {
+			add(name, filepath.Join(a.home, ".grok"), filepath.Join(a.home, ".grok"))
+		}
+	} else {
+		add(defaultID, "", filepath.Join(a.home, ".grok"))
+	}
 	entries, _ := os.ReadDir(a.home)
 	for _, e := range entries { // ReadDir sorts by name
 		name := e.Name()
@@ -282,7 +291,10 @@ func (a *grokAccounts) list() []account {
 			continue
 		}
 		path := filepath.Join(a.home, name)
-		add(strings.TrimPrefix(name, ".grok-"), path, path)
+		if id := strings.TrimPrefix(name, ".grok-"); !hasAccount(found, id) {
+			add(id, path, path)
+		}
+
 	}
 	return found
 }
@@ -293,7 +305,7 @@ func (a *grokAccounts) serves(path string) bool { return strings.HasPrefix(path,
 // login of its own here (nothing in ~/.grok), grok has no credentials worth keeping, so every
 // request is put on an account, not only the model turns; a request with no account to go on is
 // still sent as the client made it.
-func (a *grokAccounts) spends(path string) bool { return a.turn(path) || a.loginless() }
+func (a *grokAccounts) spends(path string) bool { return a.turn(path) || a.managed || a.loginless() }
 
 // logs is only the model turns: the rest of what spends (models, settings, traces) says no usage.
 func (a *grokAccounts) logs(path string) bool { return a.turn(path) }

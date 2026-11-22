@@ -213,7 +213,10 @@ func whamWindows(raw []byte, now time.Time) ([]usageWindow, string, error) {
 // MARK: Accounts
 
 type codexAccounts struct {
-	home     string
+	home string
+	// managed is a Mac with Coffer set up: its default login is served only under the Coffer name it is
+	// published as (see ownedDefault), never as "default".
+	managed  bool
 	codex    string
 	upstream string
 	now      func() time.Time
@@ -257,7 +260,13 @@ func (a *codexAccounts) list() []account {
 		}
 		found = append(found, account{ID: id, Email: l.email, Dir: dir, Path: path, Plan: l.plan, Who: who})
 	}
-	add(defaultID, "", filepath.Join(a.home, ".codex"))
+	if a.managed {
+		if name, ok := ownedDefault(a.home, a.name()); ok {
+			add(name, filepath.Join(a.home, ".codex"), filepath.Join(a.home, ".codex"))
+		}
+	} else {
+		add(defaultID, "", filepath.Join(a.home, ".codex"))
+	}
 	entries, _ := os.ReadDir(a.home)
 	for _, e := range entries { // ReadDir sorts by name
 		name := e.Name()
@@ -265,7 +274,10 @@ func (a *codexAccounts) list() []account {
 			continue
 		}
 		path := filepath.Join(a.home, name)
-		add(strings.TrimPrefix(name, ".codex-"), path, path)
+		if id := strings.TrimPrefix(name, ".codex-"); !hasAccount(found, id) {
+			add(id, path, path)
+		}
+
 	}
 	return found
 }
@@ -273,7 +285,7 @@ func (a *codexAccounts) list() []account {
 func (a *codexAccounts) serves(path string) bool { return strings.HasPrefix(path, "/backend-api/") }
 
 func (a *codexAccounts) spends(path string) bool {
-	return strings.HasPrefix(path, "/backend-api/codex/")
+	return a.managed || strings.HasPrefix(path, "/backend-api/codex/")
 }
 
 // logs is only the model turns: the rest of what spends (the model list, plans) says no usage.

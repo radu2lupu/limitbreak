@@ -67,12 +67,14 @@ const (
 	// longest life (1 hour). After that its cache is gone, so moving it costs nothing.
 	pinIdle = time.Hour
 	// maxPins is the number of session pins past which idle ones are dropped.
-	maxPins             = 1000
-	defaultID           = "default"
-	spentHeader         = "Anthropic-Ratelimit-Unified-Status"
-	resetHeader         = "Anthropic-Ratelimit-Unified-Reset"
-	credentialsKeychain = "keychain"
-	credentialsFile     = "file"
+	maxPins   = 1000
+	defaultID = "default"
+	// placeholderLoginHeader marks a `GET /_status` reply from a host whose Claude accounts are all Coffer's.
+	placeholderLoginHeader = "X-Limitbreak-Placeholder-Login"
+	spentHeader            = "Anthropic-Ratelimit-Unified-Status"
+	resetHeader            = "Anthropic-Ratelimit-Unified-Reset"
+	credentialsKeychain    = "keychain"
+	credentialsFile        = "file"
 )
 
 // MARK: Decisions (pure)
@@ -591,6 +593,9 @@ type proxy struct {
 	requests *requestLog
 	// usage makes the `GET /_usage` reports (usage_report.go); nil answers 404.
 	usage *usageReports
+	// placeholderLogin is a host that serves only Coffer Claude accounts: every request gets a pool account's
+	// token, so a client may start on a placeholder login (`GET /_status` says so in a header).
+	placeholderLogin bool
 }
 
 func newProxy(pools ...*pool) *proxy {
@@ -625,6 +630,9 @@ func (p *proxy) status() []accountStatus {
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet && r.URL.Path == "/_status" {
 		w.Header().Set("Content-Type", "application/json")
+		if p.placeholderLogin {
+			w.Header().Set(placeholderLoginHeader, "1")
+		}
 		_ = json.NewEncoder(w).Encode(p.status())
 		return
 	}
@@ -884,6 +892,8 @@ func serve(args []string) {
 	go newAuthWatch(a, notifyDesktop).run()
 	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
+	codex.managed = cofferAddress(*homeFlag) != ""
+	grok.managed = codex.managed
 	if syncer, err := openLoginSyncer(*homeFlag, a); err != nil {
 		log.Printf("logins are not synced from Coffer: %v", err)
 	} else {
@@ -892,6 +902,7 @@ func serve(args []string) {
 		go syncer.run()
 	}
 	px := newProxy(newPool(a, *upstream), newPool(codex, *codexUpstream), newPool(grok, *grokUpstream))
+	px.placeholderLogin = a.managedOnly
 	px.requests = newRequestLog(*homeFlag)
 	opencode := newOpencodeAccounts(*homeFlag, *opencodeUsage)
 	opencode.tokensFor(opencodeDays(defaultUsageSince))
