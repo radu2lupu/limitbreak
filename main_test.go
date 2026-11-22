@@ -636,3 +636,24 @@ func TestAKeychainOnlyLoginStaysListedWhileTheKeychainIsDown(t *testing.T) {
 		t.Fatalf("with the Keychain down: %v, want the Keychain-only login kept", got)
 	}
 }
+
+func TestManagedClaudePoolExcludesLocalLogins(t *testing.T) {
+	home := makeHome(t, map[string]string{"default": "default-token", "local": "local-token", "managed": "local-managed-token"})
+	a := newClaudeAccounts(home, credentialsFile, "")
+	a.managedOnly = true
+	if err := writeSyncState(home, map[string]syncEntry{loginPath("claude", "managed"): {Version: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	managed := account{ID: "managed", Path: filepath.Join(home, ".claude-managed")}
+	token := newLongToken("sk-ant-oat01-managed", time.Now())
+	if err := a.writeLongToken(managed, token); err != nil {
+		t.Fatal(err)
+	}
+	accounts := a.list()
+	if len(accounts) != 1 || accounts[0].ID != managed.ID || a.token(accounts[0]) != token.Token {
+		t.Fatalf("unexpected managed pool: %v", accounts)
+	}
+	if a.token(account{ID: defaultID, Path: filepath.Join(home, ".claude")}) != "" {
+		t.Fatal("managed pool served the native Claude sign-in")
+	}
+}

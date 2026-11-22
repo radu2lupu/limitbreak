@@ -157,6 +157,7 @@ type account struct {
 
 // claudeAccounts is the Claude provider: the logins Claude Code holds on this host.
 type claudeAccounts struct {
+	managedOnly bool
 	home        string
 	credentials string
 	claude      string
@@ -198,7 +199,7 @@ func (a *claudeAccounts) list() []account {
 	var found []account
 	var sources [][][]byte
 	defaultDir := filepath.Join(a.home, ".claude")
-	if s := a.credentialSources("", defaultDir); len(s) > 0 {
+	if s := a.credentialSources("", defaultDir); !a.managedOnly && len(s) > 0 {
 		found = append(found, account{ID: defaultID, Path: defaultDir})
 		sources = append(sources, s)
 	}
@@ -211,6 +212,9 @@ func (a *claudeAccounts) list() []account {
 	for _, name := range names {
 		path := filepath.Join(a.home, name)
 		if !strings.HasPrefix(name, ".claude-") || len(name) == len(".claude-") {
+			continue
+		}
+		if a.managedOnly && !a.cofferManaged(strings.TrimPrefix(name, ".claude-")) {
 			continue
 		}
 		if info, err := os.Stat(path); err != nil || !info.IsDir() {
@@ -303,6 +307,9 @@ func (a *claudeAccounts) cofferManaged(name string) bool {
 // credentialSources are the credential documents Claude Code may hold for a login: its Keychain
 // item and its file. Either can be the stale leftover of an older sign-in, so every one is read.
 func (a *claudeAccounts) credentialSources(configDir, path string) [][]byte {
+	if a.managedOnly {
+		return nil
+	}
 	if name, named := strings.CutPrefix(filepath.Base(configDir), ".claude-"); named && a.cofferManaged(name) {
 		return nil
 	}
@@ -367,6 +374,9 @@ const (
 // authorization dialog, a lock) must not bench an account that holds a valid token, and a request
 // then spawns no `security` at all.
 func (a *claudeAccounts) token(acc account) string {
+	if a.managedOnly && !a.cofferManaged(acc.ID) {
+		return ""
+	}
 	if t := a.cachedToken(acc); t != "" {
 		return t
 	}
@@ -867,6 +877,10 @@ func serve(args []string) {
 	}
 	log.Printf("limitbreak listening on http://%s", listener.Addr())
 	a := newClaudeAccounts(*homeFlag, *credentials, "")
+	if cofferAddress(*homeFlag) != "" {
+		a.managedOnly = true
+		a.credentials = credentialsFile
+	}
 	go newAuthWatch(a, notifyDesktop).run()
 	codex := newCodexAccounts(*homeFlag, "", *codexUpstream)
 	grok := newGrokAccounts(*homeFlag, "", *grokUpstream)
