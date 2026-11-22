@@ -77,8 +77,7 @@ requests (get, put with `if-version`, list) and is checked by tests against a fa
 one run against a real Coffer built from the branch in a temp dir.
 
 **Configuration (per Mac).** Address: `LIMITBREAK_COFFER_ADDR` or the file `~/.config/limitbreak/coffer`
-(e.g. `http://100.119.127.103:8795`). Token: `LIMITBREAK_COFFER_TOKEN_FILE`, else `~/.config/limitbreak/coffer-token` (0600), else the login Keychain item with
-service `coffer.limitbreak`, account `token`. No address or no token: sync is off and Limit Break behaves as a
+(e.g. `http://100.119.127.103:8795`). Token: `LIMITBREAK_COFFER_TOKEN_FILE`, else `~/.config/limitbreak/coffer-token` (0600). Managed Claude accounts use a mode-0600 cache in their account directory. The first sync after upgrade populates missing caches from Coffer. No address or no token: sync is off and Limit Break behaves as a
 Mac with no Coffer.
 
 ## A default login
@@ -120,7 +119,7 @@ Mini as `_coffer`; `IP_<mac>` is that Mac's tailnet IP.
 1. **Deploy Coffer with the conditional put** (the branch `logins-from-coffer` of `~/Code/coffer`), the way the
    README's "Deploy" section describes, and restart the daemon. Without it every write-back is a 404/405 and
    Limit Break stays read-only.
-2. **One identity per Mac** (prints the token once; pipe it straight into that Mac's Keychain):
+2. **One identity per Mac** (prints the token once; store it in that Mac's restricted token file):
 
    ```sh
    ssh mini
@@ -130,8 +129,8 @@ Mini as `_coffer`; `IP_<mac>` is that Mac's tailnet IP.
    ```
 
    Store each token on its own Mac, from stdin:
-   `security add-generic-password -U -s coffer.limitbreak -a token -w "$(cat)"` (paste, Ctrl-D), then
-   `mkdir -p ~/.config/limitbreak && printf 'http://100.119.127.103:8795' > ~/.config/limitbreak/coffer`.
+   `(umask 077; mkdir -p ~/.config/limitbreak && cat > ~/.config/limitbreak/coffer-token)` (paste, Ctrl-D), then
+   `printf 'http://100.119.127.103:8795' > ~/.config/limitbreak/coffer`.
 3. **Rules** (read, write and list on `limitbreak/*`, pinned to the Mac's tailnet IP; a Mac that should not get
    a login gets a narrower pattern, e.g. `limitbreak/grok/*` only):
 

@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,11 +22,9 @@ import (
 )
 
 const (
-	cofferAddrEnv      = "LIMITBREAK_COFFER_ADDR"
-	cofferTokenFileEnv = "LIMITBREAK_COFFER_TOKEN_FILE"
-	// cofferKeychainService holds this Mac's Coffer identity token (account "token").
-	cofferKeychainService = "coffer.limitbreak"
-	cofferVersionHeader   = "X-Coffer-Version"
+	cofferAddrEnv       = "LIMITBREAK_COFFER_ADDR"
+	cofferTokenFileEnv  = "LIMITBREAK_COFFER_TOKEN_FILE"
+	cofferVersionHeader = "X-Coffer-Version"
 	// cofferMaxValue is the most a login read from Coffer may be; a Grok or Codex auth.json is a few KB.
 	cofferMaxValue = 256 * 1024
 )
@@ -194,8 +191,7 @@ func cofferTokenFile(home string) string {
 }
 
 // cofferToken is this Mac's Coffer identity token: the file named by $LIMITBREAK_COFFER_TOKEN_FILE, else
-// the token file beside the address file, else the login Keychain item (service coffer.limitbreak,
-// account token). It is never logged.
+// the token file beside the address file. It is never logged.
 func cofferToken(home string) string {
 	if path := os.Getenv(cofferTokenFileEnv); path != "" {
 		raw, _ := os.ReadFile(path)
@@ -206,11 +202,7 @@ func cofferToken(home string) string {
 			return token
 		}
 	}
-	out, err := exec.Command("security", "find-generic-password", "-s", cofferKeychainService, "-a", "token", "-w").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
+	return ""
 }
 
 // openCoffer is the client for this Mac's Coffer; nil with a reason when it has no address or token
@@ -222,7 +214,7 @@ func openCoffer(home string) (*cofferClient, error) {
 	}
 	token := cofferToken(home)
 	if token == "" {
-		return nil, fmt.Errorf("no Coffer token (%s, %s, or Keychain service %s)", cofferTokenFileEnv, cofferTokenFile(home), cofferKeychainService)
+		return nil, fmt.Errorf("no Coffer token (%s, %s)", cofferTokenFileEnv, cofferTokenFile(home))
 	}
 	return newCofferClient(addr, token)
 }

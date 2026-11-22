@@ -227,6 +227,9 @@ func loginKinds(claude *claudeAccounts, validate tokenValidator) []syncKind {
 				return nil
 			},
 			prepare: func(acc account) error {
+				if claude.cofferManaged(acc.ID) {
+					return os.MkdirAll(acc.Path, 0o700)
+				}
 				if len(claude.credentialSources(acc.Dir, acc.Path)) > 0 {
 					return nil // a sign-in of its own: the token is added beside it
 				}
@@ -238,7 +241,8 @@ func loginKinds(claude *claudeAccounts, validate tokenValidator) []syncKind {
 				if err := json.Unmarshal(raw, &t); err != nil {
 					return err
 				}
-				return claude.writeLongToken(acc, t)
+				claude.forgetToken(acc)
+				return claude.storeLongToken(acc, t, false)
 			},
 			ends: func(raw []byte) time.Time {
 				var t longToken
